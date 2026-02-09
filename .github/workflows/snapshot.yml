@@ -3,7 +3,7 @@ name: Snapshot (stooq)
 on:
   schedule:
     # DST (Mar–Nov): 16:30 ET = 20:30 UTC
-    - cron: "30 20 * * 1-5"
+    - cron: "40 5 * * 1-5"
     # Standard time (Nov–Mar): 16:30 ET = 21:30 UTC
     - cron: "30 21 * * 1-5"
   workflow_dispatch:
