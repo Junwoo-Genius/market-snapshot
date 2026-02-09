@@ -13,3 +13,4 @@ jobs:
         run: |
           date -u
           echo "ping ok"
+# schedule re-register
