@@ -39,7 +39,9 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
-env:
+# 여기서부터 구글 드라이브 업로드 단계입니다.
+      - name: Upload Report to Google Drive
+        env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: |
           pip install google-api-python-client google-auth
@@ -54,13 +56,18 @@ env:
           creds = service_account.Credentials.from_service_account_info(info)
           service = build('drive', 'v3', credentials=creds)
 
-          # 2. 업로드 설정 (폴더 ID를 입력하세요)
-          folder_id = '1X9Yec4i9ncvAltPpwQn1J-FNkxrdbiGW' 
+          # 2. 업로드 설정 (수정된 폴더 ID 사용)
+          folder_id = '1X9Yec4i9ncvAltPpwQn1J-FNkxrdbiGW'
+          
+          # 파일 경로 확인: 'public/report.json' 또는 'report.json' 
+          # Pages 배포용이 public 폴더 안에 있다면 아래 경로를 사용합니다.
+          file_path = 'public/report.json' 
+          
           file_metadata = {
               'name': 'report.json',
               'parents': [folder_id]
           }
-          media = MediaFileUpload('report.json', mimetype='application/json')
+          media = MediaFileUpload(file_path, mimetype='application/json')
 
           # 3. 기존 파일이 있으면 덮어쓰거나 새로 생성
           results = service.files().list(q=f\"name='report.json' and '{folder_id}' in parents\", fields='files(id)').execute()
