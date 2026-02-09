@@ -5,7 +5,6 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
-# 나중에 커밋/푸시 기능을 추가할 수도 있으니 권한은 미리 열어두는게 좋습니다.
 permissions:
   contents: write
 
@@ -16,7 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show time and Ping
+      - name: Show time
         run: |
           echo "Current UTC Time: $(date -u)"
           echo "Current KST Time: $(date -d '+9 hours' -u +'%Y-%m-%d %H:%M:%S')"
