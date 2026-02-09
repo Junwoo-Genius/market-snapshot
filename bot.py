@@ -10,10 +10,9 @@ RSI_PERIOD = 14
 EMA_PERIOD = 20
 SMA_PERIOD = 60
 
-# Stooq는 미국 주식 심볼이 "aapl.us" 형태
+# Stooq (미국 주식: aapl.us 형태)
 STOOQ_BASE = "https://stooq.com/q/d/l/"
 
-# 파일/출력 경로
 TICKERS_FILE = os.environ.get("TICKERS_FILE", "tickers.txt")
 OUT_PATH = os.environ.get("OUT_PATH", "public/report.json")
 
@@ -71,15 +70,16 @@ def compute_indicators(close_series):
 
 
 def to_stooq_symbol(us_symbol: str) -> str:
-    # "AAPL" -> "aapl.us"
     return f"{us_symbol.lower()}.us"
 
 
-def fetch_stooq_daily(us_symbol: str, max_rows: int = 2000):
+def fetch_stooq_daily(us_symbol: str, keep_last: int = 3000):
     """
     Stooq CSV:
-    https://stooq.com/q/d/l/?s=aapl.us&i=d
-    Columns: Date,Open,High,Low,Close,Volume
+      https://stooq.com/q/d/l/?s=aapl.us&i=d
+    보통 오래된->최신 오름차순이라,
+    전체를 읽은 뒤 Date 정렬 후 '최신 keep_last개'만 사용해서
+    last_date가 과거로 고정되는 문제를 방지한다.
     """
     s = to_stooq_symbol(us_symbol)
     params = {"s": s, "i": "d"}
@@ -91,39 +91,31 @@ def fetch_stooq_daily(us_symbol: str, max_rows: int = 2000):
         raise RuntimeError(f"{us_symbol}: no data from stooq")
 
     reader = csv.DictReader(StringIO(text))
-    dates, o, h, l, c, v = [], [], [], [], [], []
+    rows = []
     for row in reader:
-        # Stooq sometimes has empty lines
         if not row.get("Date"):
             continue
+        rows.append(row)
+
+    if len(rows) < 10:
+        raise RuntimeError(f"{us_symbol}: insufficient rows ({len(rows)})")
+
+    rows.sort(key=lambda x: x["Date"])
+    rows = rows[-keep_last:]  # ✅ 최신 데이터 유지
+
+    dates, o, h, l, c, v = [], [], [], [], [], []
+    for row in rows:
         dates.append(row["Date"])
         o.append(float(row["Open"]))
         h.append(float(row["High"]))
         l.append(float(row["Low"]))
         c.append(float(row["Close"]))
         v.append(int(float(row["Volume"])))
-        if len(dates) >= max_rows:
-            break
-
-    if len(dates) < 10:
-        raise RuntimeError(f"{us_symbol}: insufficient rows ({len(dates)})")
-
-    # Stooq returns ascending by date already, but keep safe
-    # If not sorted, sort all together
-    if dates != sorted(dates):
-        idx = sorted(range(len(dates)), key=lambda i: dates[i])
-        dates = [dates[i] for i in idx]
-        o = [o[i] for i in idx]
-        h = [h[i] for i in idx]
-        l = [l[i] for i in idx]
-        c = [c[i] for i in idx]
-        v = [v[i] for i in idx]
 
     return dates, o, h, l, c, v
 
 
 def _iso_week_key(date_str: str):
-    # date_str: YYYY-MM-DD
     dt = datetime(int(date_str[0:4]), int(date_str[5:7]), int(date_str[8:10]))
     iso = dt.isocalendar()
     return int(iso.year), int(iso.week)
@@ -146,7 +138,7 @@ def resample_weekly(dates, o, h, l, c, v):
     for key in sorted(buckets.keys()):
         b = buckets[key]
         fi, li = b["fi"], b["li"]
-        out_dates.append(dates[li])  # 주 마지막 거래일
+        out_dates.append(dates[li])
         out_o.append(o[fi])
         out_h.append(b["high"])
         out_l.append(b["low"])
@@ -173,7 +165,7 @@ def resample_monthly(dates, o, h, l, c, v):
     for key in sorted(buckets.keys()):
         b = buckets[key]
         fi, li = b["fi"], b["li"]
-        out_dates.append(dates[li])  # 월 마지막 거래일
+        out_dates.append(dates[li])
         out_o.append(o[fi])
         out_h.append(b["high"])
         out_l.append(b["low"])
@@ -195,7 +187,7 @@ def main():
 
     for sym in tickers:
         try:
-            dates, o, h, l, c, v = fetch_stooq_daily(sym)
+            dates, o, h, l, c, v = fetch_stooq_daily(sym, keep_last=3000)
         except Exception as e:
             report["tickers"][sym] = {"error": str(e)}
             continue
