@@ -2,7 +2,7 @@ name: Snapshot (stooq)
 
 on:
   schedule:
-  - cron: "42 5 * * *"
+  - cron: "55 5 * * *"
   workflow_dispatch:
 
 permissions:
