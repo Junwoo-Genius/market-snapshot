@@ -38,3 +38,39 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          pip install google-api-python-client google-auth
+          python -c "
+          import os, json
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          # 1. 비밀 키 설정
+          info = json.loads(os.environ['GCP_SA_KEY'])
+          creds = service_account.Credentials.from_service_account_info(info)
+          service = build('drive', 'v3', credentials=creds)
+
+          # 2. 업로드 설정 (폴더 ID를 입력하세요)
+          folder_id = '1X9Yec4i9ncvAltPpwQn1J-FNkxrdbiGW' 
+          file_metadata = {
+              'name': 'report.json',
+              'parents': [folder_id]
+          }
+          media = MediaFileUpload('report.json', mimetype='application/json')
+
+          # 3. 기존 파일이 있으면 덮어쓰거나 새로 생성
+          results = service.files().list(q=f\"name='report.json' and '{folder_id}' in parents\", fields='files(id)').execute()
+          files = results.get('files', [])
+
+          if files:
+              file_id = files[0]['id']
+              service.files().update(fileId=file_id, media_body=media).execute()
+              print(f'File updated: {file_id}')
+          else:
+              file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+              print(f'File created: {file.get(\"id\")}')
+          "
