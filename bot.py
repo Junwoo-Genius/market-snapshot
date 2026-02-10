@@ -1,133 +1,266 @@
+import os
 import json
-import urllib.request
-from datetime import timedelta
+import csv
+import requests
+from io import StringIO
+from datetime import datetime, timezone
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+# ===== Parameters (fixed) =====
+RSI_PERIOD = 14
+EMA_PERIOD = 20
+SMA_PERIOD = 60
 
+STOOQ_BASE = "https://stooq.com/q/d/l/"
 
-# -----------------------------
-# 1) JSON 자동 로드
-# -----------------------------
-def load_daily_json(symbol: str, base_url: str) -> pd.DataFrame:
-    """
-    base_url 예시:
-      - "https://junwoo-genius.github.io/market-snapshot/prices"
-      -> 실제 요청 URL: {base_url}/{symbol}_daily.json
-    """
-    url = f"{base_url}/{symbol}_daily.json"
+TICKERS_FILE = os.environ.get("TICKERS_FILE", "tickers.txt")
+OUT_PATH = os.environ.get("OUT_PATH", "public/report.json")
 
-    with urllib.request.urlopen(url) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-
-    # payload["data"] 안에 date/open/high/low/close/volume이 있다고 가정
-    df = pd.DataFrame(payload["data"]).copy()
-
-    # 표준 컬럼명으로 통일
-    rename_map = {
-        "date": "Date",
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close",
-        "volume": "Volume",
-    }
-    df = df.rename(columns=rename_map)
-
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.sort_values("Date").reset_index(drop=True)
-
-    required = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"JSON data is missing columns: {missing}")
-
-    return df
+# ✅ 추가: 차트/계산용 일봉 JSON 저장 폴더
+DAILY_JSON_DIR = os.environ.get("DAILY_JSON_DIR", "public/json")
 
 
-# -----------------------------
-# 2) 최근 N개월 필터 + 지표
-# -----------------------------
-def prepare_recent(df: pd.DataFrame, months: int = 3) -> pd.DataFrame:
-    end_date = df["Date"].max()
-    start_date = end_date - pd.DateOffset(months=months)
-    out = df[df["Date"] >= start_date].copy()
-
-    out["EMA20"] = out["Close"].ewm(span=20, adjust=False).mean()
-    out["SMA60"] = out["Close"].rolling(60).mean()
-
+def read_tickers(path=TICKERS_FILE):
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s and not s.startswith("#"):
+                out.append(s.upper())
     return out
 
 
-# -----------------------------
-# 3) 매물대(Volume Profile) 기반 지지·저항 레벨 추출
-# -----------------------------
-def volume_profile_levels(df: pd.DataFrame, bins: int = 20, top_n: int = 3) -> list[float]:
-    # Close 가격대에 거래량을 가중치로 히스토그램
-    hist, edges = np.histogram(df["Close"], bins=bins, weights=df["Volume"])
-    centers = (edges[:-1] + edges[1:]) / 2
-
-    # 거래량 큰 구간 top_n 선택
-    idx = np.argsort(hist)[-top_n:]
-    levels = sorted(float(centers[i]) for i in idx)
-    return levels
+def sma(values, period):
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
 
 
-# -----------------------------
-# 4) 차트 생성 (거래량 아래 패널, 지지/저항 수평선 표기)
-# -----------------------------
-def plot_price_volume_sr(
-    df: pd.DataFrame,
-    symbol: str,
-    levels: list[float],
-    out_path: str = "chart.png",
-):
-    fig, (ax_price, ax_vol) = plt.subplots(
-        2, 1, figsize=(13, 7), sharex=True,
-        gridspec_kw={"height_ratios": [3, 1]}
-    )
-
-    # 가격 패널
-    ax_price.plot(df["Date"], df["Close"], label="Close")
-    ax_price.plot(df["Date"], df["EMA20"], label="EMA20")
-    ax_price.plot(df["Date"], df["SMA60"], label="SMA60")
-
-    # 지지/저항(매물대 상위 구간)
-    x_text = df["Date"].iloc[-1]
-    for lvl in levels:
-        ax_price.axhline(lvl, linestyle="--", linewidth=1.4)
-        ax_price.text(x_text, lvl, f" {lvl:.2f}", va="center")
-
-    ax_price.set_title(f"{symbol} (Recent) | Close + EMA20 + SMA60 | S/R from Volume Profile")
-    ax_price.set_ylabel("Price")
-    ax_price.legend(loc="upper left")
-
-    # 거래량 패널 (겹치지 않게 아래)
-    ax_vol.bar(df["Date"], df["Volume"])
-    ax_vol.set_ylabel("Volume")
-    ax_vol.set_xlabel("Date")
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
+def ema(values, period):
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
 
 
-# -----------------------------
-# 5) 실행 예시
-# -----------------------------
+def rsi(values, period=14):
+    # Wilder's RSI (TradingView-style smoothing)
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+    for i in range(1, len(values)):
+        diff = values[i] - values[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def compute_indicators(close_series):
+    return {
+        "rsi14": rsi(close_series, RSI_PERIOD),
+        "ema20": ema(close_series, EMA_PERIOD),
+        "sma60": sma(close_series, SMA_PERIOD),
+    }
+
+
+def to_stooq_symbol(us_symbol: str) -> str:
+    return f"{us_symbol.lower()}.us"
+
+
+def fetch_stooq_daily(us_symbol: str, keep_last: int = 3000):
+    params = {"s": to_stooq_symbol(us_symbol), "i": "d"}
+    r = requests.get(STOOQ_BASE, params=params, timeout=30)
+    r.raise_for_status()
+
+    text = r.text.strip()
+    if not text or "No data" in text:
+        raise RuntimeError(f"{us_symbol}: no data from stooq")
+
+    reader = csv.DictReader(StringIO(text))
+    rows = [row for row in reader if row.get("Date")]
+
+    if len(rows) < 10:
+        raise RuntimeError(f"{us_symbol}: insufficient rows ({len(rows)})")
+
+    rows.sort(key=lambda x: x["Date"])
+    rows = rows[-keep_last:]
+
+    dates, o, h, l, c, v = [], [], [], [], [], []
+    for row in rows:
+        dates.append(row["Date"])
+        o.append(float(row["Open"]))
+        h.append(float(row["High"]))
+        l.append(float(row["Low"]))
+        c.append(float(row["Close"]))
+        v.append(int(float(row["Volume"])))
+
+    return dates, o, h, l, c, v
+
+
+# ✅ 추가: 일봉 OHLCV를 daily.json으로 저장 (차트/계산용)
+def save_daily_ohlcv_json(sym: str, dates, o, h, l, c, v, out_dir: str = DAILY_JSON_DIR):
+    os.makedirs(out_dir, exist_ok=True)
+    payload = {
+        "symbol": sym.upper(),
+        "data": [
+            {
+                "date": dates[i],
+                "open": float(o[i]),
+                "high": float(h[i]),
+                "low": float(l[i]),
+                "close": float(c[i]),
+                "volume": float(v[i]),
+            }
+            for i in range(len(dates))
+        ],
+    }
+    out_path = os.path.join(out_dir, f"{sym.upper()}_daily.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return out_path
+
+
+def _iso_week_key(date_str: str):
+    dt = datetime(int(date_str[0:4]), int(date_str[5:7]), int(date_str[8:10]))
+    iso = dt.isocalendar()
+    return int(iso.year), int(iso.week)
+
+
+def resample_weekly(dates, o, h, l, c, v):
+    buckets = {}
+    for i, d in enumerate(dates):
+        key = _iso_week_key(d)
+        if key not in buckets:
+            buckets[key] = {"fi": i, "li": i, "high": h[i], "low": l[i], "vol": v[i]}
+        else:
+            b = buckets[key]
+            b["li"] = i
+            b["high"] = max(b["high"], h[i])
+            b["low"] = min(b["low"], l[i])
+            b["vol"] += v[i]
+
+    out_dates, out_c, out_v = [], [], []
+    for key in sorted(buckets.keys()):
+        b = buckets[key]
+        li = b["li"]
+        out_dates.append(dates[li])
+        out_c.append(c[li])
+        out_v.append(b["vol"])
+
+    return {"dates": out_dates, "close": out_c, "volume": out_v}
+
+
+def resample_monthly(dates, o, h, l, c, v):
+    buckets = {}
+    for i, d in enumerate(dates):
+        key = (int(d[0:4]), int(d[5:7]))
+        if key not in buckets:
+            buckets[key] = {"fi": i, "li": i, "high": h[i], "low": l[i], "vol": v[i]}
+        else:
+            b = buckets[key]
+            b["li"] = i
+            b["high"] = max(b["high"], h[i])
+            b["low"] = min(b["low"], l[i])
+            b["vol"] += v[i]
+
+    out_dates, out_c, out_v = [], [], []
+    for key in sorted(buckets.keys()):
+        b = buckets[key]
+        li = b["li"]
+        out_dates.append(dates[li])
+        out_c.append(c[li])
+        out_v.append(b["vol"])
+
+    return {"dates": out_dates, "close": out_c, "volume": out_v}
+
+
+def main():
+    tickers = read_tickers()
+
+    report = {
+        "asof_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": "stooq",
+        "params": {"rsi": RSI_PERIOD, "ema": EMA_PERIOD, "sma": SMA_PERIOD},
+        "tickers": {},
+    }
+
+    # ✅ daily.json 저장 폴더 보장
+    os.makedirs(DAILY_JSON_DIR, exist_ok=True)
+
+    for sym in tickers:
+        try:
+            dates, o, h, l, c, v = fetch_stooq_daily(sym, keep_last=3000)
+
+            # ✅ 추가: 차트/계산용 daily.json 생성(항상 최신으로 덮어쓰기)
+            save_daily_ohlcv_json(sym, dates, o, h, l, c, v)
+
+        except Exception as e:
+            report["tickers"][sym] = {"error": str(e)}
+            continue
+
+        daily_ind = compute_indicators(c)
+
+        # ===== 최근 5거래일 거래량 관련 =====
+        last5_vol = v[-5:] if len(v) >= 5 else v[:]
+        last5_dates = dates[-5:] if len(dates) >= 5 else dates[:]
+
+        prev_vol = v[-2] if len(v) >= 2 else None
+        vol_change_pct = None
+        if prev_vol and prev_vol != 0:
+            vol_change_pct = (v[-1] - prev_vol) / prev_vol * 100.0
+        # ===================================
+
+        w = resample_weekly(dates, o, h, l, c, v)
+        m = resample_monthly(dates, o, h, l, c, v)
+
+        weekly_ind = compute_indicators(w["close"]) if w["close"] else {"rsi14": None, "ema20": None, "sma60": None}
+        monthly_ind = compute_indicators(m["close"]) if m["close"] else {"rsi14": None, "ema20": None, "sma60": None}
+
+        report["tickers"][sym] = {
+            "daily": {
+                "last_date": dates[-1],
+                "last_close": c[-1],
+                "last_volume": v[-1],
+                "volumes_dates_last5": last5_dates,
+                "volumes_last5": last5_vol,
+                "prev_volume": prev_vol,
+                "vol_change_pct": vol_change_pct,
+                **daily_ind,
+            },
+            "weekly": {
+                "last_date": w["dates"][-1] if w["dates"] else None,
+                "last_close": w["close"][-1] if w["close"] else None,
+                "last_volume": w["volume"][-1] if w["volume"] else None,
+                **weekly_ind,
+            },
+            "monthly": {
+                "last_date": m["dates"][-1] if m["dates"] else None,
+                "last_close": m["close"][-1] if m["close"] else None,
+                "last_volume": m["volume"][-1] if m["volume"] else None,
+                **monthly_ind,
+            },
+        }
+
+    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+    with open(OUT_PATH, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+
 if __name__ == "__main__":
-    SYMBOL = "IREN"
-    BASE_URL = "https://junwoo-genius.github.io/market-snapshot/prices"  # <- 너가 배포하는 경로로 변경
-    MONTHS = 3
-    BINS = 20
-    TOP_N = 3
-    OUT = f"{SYMBOL}_3M_SR_separate_volume.png"
-
-    df_all = load_daily_json(SYMBOL, BASE_URL)
-    df_recent = prepare_recent(df_all, months=MONTHS)
-    sr_levels = volume_profile_levels(df_recent, bins=BINS, top_n=TOP_N)
-
-    plot_price_volume_sr(df_recent, SYMBOL, sr_levels, out_path=OUT)
-    print("Saved:", OUT)
-
+    main()
