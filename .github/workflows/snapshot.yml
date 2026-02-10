@@ -1,1 +1,121 @@
+name: Snapshot (stooq)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas
+
+      - name: Run bot
+        run: |
+          python bot.py
+
+      - name: Convert daily CSV → daily JSON
+        run: |
+          python - <<'PY'
+          import os, glob, json
+          import pandas as pd
+
+          CSV_DIR = "public/csv"
+          OUT_DIR = "public/json"
+          os.makedirs(OUT_DIR, exist_ok=True)
+
+          files = sorted(glob.glob(os.path.join(CSV_DIR, "*_daily.csv")))
+          if not files:
+              print(f"No *_daily.csv files found under {CSV_DIR}. Skipping.")
+              raise SystemExit(0)
+
+          def to_float(x):
+              # NaN 방지: 숫자 변환 실패하면 에러 내서 파이프라인에서 잡히게 함
+              return float(x)
+
+          for fp in files:
+              base = os.path.basename(fp)               # 예: IREN_daily.csv
+              symbol = base.replace("_daily.csv", "").upper()
+
+              df = pd.read_csv(fp)
+
+              # 컬럼 표준화(대소문자/별칭 대응)
+              cols = {c.lower(): c for c in df.columns}
+
+              # date 대체 키 흡수
+              if "date" not in cols:
+                  for alt in ("timestamp", "datetime", "time"):
+                      if alt in cols:
+                          df = df.rename(columns={cols[alt]: "date"})
+                          cols = {c.lower(): c for c in df.columns}
+                          break
+
+              required = ["date", "open", "high", "low", "close", "volume"]
+              missing = [c for c in required if c not in cols]
+              if missing:
+                  raise ValueError(f"{base} missing required columns: {missing}. Found={list(df.columns)}")
+
+              # 필요한 컬럼만 추출 + rename
+              df2 = df[[cols["date"], cols["open"], cols["high"], cols["low"], cols["close"], cols["volume"]]].copy()
+              df2.columns = ["date", "open", "high", "low", "close", "volume"]
+
+              # 날짜 표준화 (YYYY-MM-DD)
+              df2["date"] = pd.to_datetime(df2["date"], errors="raise").dt.strftime("%Y-%m-%d")
+
+              # 숫자 표준화
+              for c in ["open", "high", "low", "close", "volume"]:
+                  df2[c] = pd.to_numeric(df2[c], errors="raise")
+
+              # JSON payload (권장 형태)
+              payload = {
+                  "symbol": symbol,
+                  "data": [
+                      {
+                          "date": r["date"],
+                          "open": to_float(r["open"]),
+                          "high": to_float(r["high"]),
+                          "low": to_float(r["low"]),
+                          "close": to_float(r["close"]),
+                          "volume": to_float(r["volume"]),
+                      }
+                      for r in df2.to_dict(orient="records")
+                  ]
+              }
+
+              out_path = os.path.join(OUT_DIR, f"{symbol}_daily.json")
+              with open(out_path, "w", encoding="utf-8") as f:
+                  json.dump(payload, f, ensure_ascii=False)
+
+              print(f"Generated: {out_path}")
+
+          PY
+
+      - name: Commit report + daily JSON if changed
+        run: |
+          git config user.name "snapshot-bot"
+          git config user.email "snapshot-bot@users.noreply.github.com"
+
+          git add public/report.json
+          git add public/json
+
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+
+          git commit -m "update report + daily json"
+          git push
 
