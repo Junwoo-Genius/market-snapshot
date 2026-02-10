@@ -1,6 +1,11 @@
 name: Snapshot (stooq)
 
 on:
+  # ✅ 평일(월~금) 자동 실행
+  # - GitHub Actions cron은 UTC 기준
+  # - "장마감 후 30분"에 맞추려면 너가 정한 UTC로 조절하면 됨
+  schedule:
+    - cron: "30 21 * * 1-5"   # 예시: 21:30 UTC (평일)
   workflow_dispatch:
 
 permissions:
@@ -27,14 +32,18 @@ jobs:
         run: |
           python bot.py
 
-      - name: Commit report if changed
+      - name: Commit report & csv if changed
         run: |
           git config user.name "snapshot-bot"
           git config user.email "snapshot-bot@users.noreply.github.com"
-          git add public/report.json
+
+          # ✅ 핵심: report.json + public/csv 둘 다 추가
+          git add public/report.json public/csv
+
           if git diff --cached --quiet; then
             echo "No changes"
             exit 0
           fi
-          git commit -m "update report"
+
+          git commit -m "update snapshot"
           git push
