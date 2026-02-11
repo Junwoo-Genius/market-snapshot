@@ -33,7 +33,7 @@ DEFAULT_PARAMS = {
 
 # tickers.json (없으면 기본)
 # 예: ["IREN","PLTR","NVDA"]
-TICKERS_FILE = ROOT / "tickers.json"
+TICKERS_FILE = ROOT / "tickers.txt"
 
 # Stooq 심볼 변환: 미국 주식 기준 ".us"
 def to_stooq_symbol(ticker: str) -> str:
