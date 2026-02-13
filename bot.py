@@ -1,249 +1,295 @@
-#!/usr/bin/env python3
-# bot.py
-# market-snapshot 자동화: report.json(1년 OHLCV+지표) + csv(5년 OHLCV)
-# - 트리거: workflow_dispatch (수동/외부 호출)
-# - 산출물:
-#   1) public/report.json
-#   2) public/csv/{TICKER}_daily.csv  (최근 5년)
-#
-# 변경사항(핵심):
-# - pandas.compat.StringIO 사용 제거 → io.StringIO로 고정
-# - tickers.txt 사용 (줄 단위 종목, 주석/빈줄 허용)
-
-import os, json, time
-from datetime import datetime, timezone
-from pathlib import Path
-from io import StringIO
-
-import pandas as pd
+import os
+import json
+import csv
 import requests
+from io import StringIO
+from datetime import datetime, timezone
+
+# ===== Parameters (fixed) =====
+RSI_PERIOD = 14
+EMA_PERIOD = 20
+SMA_PERIOD = 60
+
+STOOQ_BASE = "https://stooq.com/q/d/l/"
+
+TICKERS_FILE = os.environ.get("TICKERS_FILE", "tickers.txt")
+OUT_PATH = os.environ.get("OUT_PATH", "public/report.json")
+
+# CSV 저장 위치 (차트/시계열용)
+CSV_DIR = os.environ.get("CSV_DIR", "public/csv")
+
+# stooq에서 가져올 최대 행 수 (10년 이상 커버를 위해 넉넉하게)
+KEEP_LAST = int(os.environ.get("KEEP_LAST", "5000"))
 
 
-# =========================
-# 설정
-# =========================
-ROOT = Path(__file__).resolve().parent
-PUBLIC_DIR = ROOT / "public"
-CSV_DIR = PUBLIC_DIR / "csv"
-PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
-CSV_DIR.mkdir(parents=True, exist_ok=True)
-
-DEFAULT_PARAMS = {
-    "rsi": 14,
-    "ema": 20,
-    "sma": 60,
-    "history_days_report": 252,   # report.json 저장용 (약 1년)
-    "history_days_csv": 1260,     # csv 저장용 (약 5년)
-}
-
-# 종목 파일: tickers.txt (줄 단위)
-# 예)
-# IREN
-# PLTR
-# NVDA
-TICKERS_FILE = ROOT / "tickers.txt"
+def read_tickers(path=TICKERS_FILE):
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s and not s.startswith("#"):
+                out.append(s.upper())
+    return out
 
 
-# =========================
-# 유틸
-# =========================
-def load_tickers_from_txt(path: Path) -> list[str]:
-    if not path.exists():
-        return ["IREN"]
-
-    tickers: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith("#"):
-            continue
-        # "IREN,PLTR" 같이 들어왔을 가능성도 방어
-        parts = [p.strip() for p in s.replace(";", ",").split(",")]
-        for p in parts:
-            if p and not p.startswith("#"):
-                tickers.append(p.upper())
-
-    # 중복 제거(순서 유지)
-    seen = set()
-    uniq = []
-    for t in tickers:
-        if t not in seen:
-            seen.add(t)
-            uniq.append(t)
-    return uniq or ["IREN"]
+def sma(values, period):
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
 
 
-# Stooq 심볼 변환: 미국 주식 기준 ".us"
-def to_stooq_symbol(ticker: str) -> str:
-    t = ticker.strip().lower()
-    if t.endswith(".us"):
-        return t
-    return f"{t}.us"
+def ema(values, period):
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
 
 
-def stooq_daily_url(ticker: str) -> str:
-    # Stooq CSV 다운로드 (일봉)
-    # 예: https://stooq.com/q/d/l/?s=iren.us&i=d
-    return f"https://stooq.com/q/d/l/?s={to_stooq_symbol(ticker)}&i=d"
+def rsi(values, period=14):
+    # Wilder's RSI (TradingView-style smoothing)
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+    for i in range(1, len(values)):
+        diff = values[i] - values[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-# =========================
-# 기술지표
-# =========================
-def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = (-delta).where(delta < 0, 0.0)
-
-    # Wilder smoothing과 유사한 EMA(alpha=1/period)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-# =========================
-# 데이터 로드
-# =========================
-def fetch_stooq_daily(ticker: str, retries: int = 3, timeout: int = 20) -> pd.DataFrame:
-    url = stooq_daily_url(ticker)
-    last_err = None
-
-    for i in range(retries):
-        try:
-            r = requests.get(url, timeout=timeout, headers={"User-Agent": "market-snapshot-bot/1.0"})
-            r.raise_for_status()
-
-            # Stooq: Date,Open,High,Low,Close,Volume
-            df = pd.read_csv(StringIO(r.text))
-
-            if "Date" not in df.columns:
-                raise ValueError("Stooq CSV format unexpected (no Date column).")
-
-            df["Date"] = pd.to_datetime(df["Date"], utc=False)
-            df = df.sort_values("Date").reset_index(drop=True)
-
-            # 숫자 변환 방어
-            for c in ["Open", "High", "Low", "Close"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-
-            if "Volume" in df.columns:
-                df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).astype("int64")
-            else:
-                df["Volume"] = 0
-
-            # 유효 데이터 체크
-            if df["Close"].isna().all():
-                raise ValueError("All Close values are NaN after parsing.")
-
-            return df
-
-        except Exception as e:
-            last_err = e
-            time.sleep(1.2 * (i + 1))
-
-    raise RuntimeError(f"Failed to fetch {ticker} from Stooq after {retries} retries: {last_err}")
-
-
-# =========================
-# 저장
-# =========================
-def save_csv_5y(ticker: str, df: pd.DataFrame, history_days: int) -> None:
-    out = df.tail(history_days).copy()
-    out_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    out = out[out_cols]
-    out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
-    path = CSV_DIR / f"{ticker.upper()}_daily.csv"
-    out.to_csv(path, index=False)
-
-
-def build_report_entry(ticker: str, df: pd.DataFrame, params: dict) -> dict:
-    df1y = df.tail(params["history_days_report"]).copy()
-
-    df1y["EMA20"] = df1y["Close"].ewm(span=params["ema"], adjust=False).mean()
-    df1y["SMA60"] = df1y["Close"].rolling(params["sma"]).mean()
-    df1y["RSI14"] = compute_rsi(df1y["Close"], params["rsi"])
-
-    last = df1y.iloc[-1]
-    last_date = last["Date"].strftime("%Y-%m-%d")
-
-    history_1y = []
-    for _, row in df1y.iterrows():
-        history_1y.append(
-            {
-                "date": row["Date"].strftime("%Y-%m-%d"),
-                "open": float(row["Open"]) if pd.notna(row["Open"]) else None,
-                "high": float(row["High"]) if pd.notna(row["High"]) else None,
-                "low": float(row["Low"]) if pd.notna(row["Low"]) else None,
-                "close": float(row["Close"]) if pd.notna(row["Close"]) else None,
-                "volume": int(row["Volume"]) if pd.notna(row["Volume"]) else 0,
-            }
-        )
-
-    def safe_float(x):
-        try:
-            return float(x) if pd.notna(x) else None
-        except Exception:
-            return None
-
-    daily = {
-        "last_date": last_date,
-        "last_close": safe_float(last["Close"]),
-        "last_volume": int(last["Volume"]) if pd.notna(last["Volume"]) else 0,
-        "rsi14": safe_float(last["RSI14"]),
-        "ema20": safe_float(last["EMA20"]),
-        "sma60": safe_float(last["SMA60"]),
+def compute_indicators(close_series):
+    return {
+        "rsi14": rsi(close_series, RSI_PERIOD),
+        "ema20": ema(close_series, EMA_PERIOD),
+        "sma60": sma(close_series, SMA_PERIOD),
     }
 
-    return {"daily": daily, "history_1y": history_1y}
+
+def to_stooq_symbol(us_symbol: str) -> str:
+    # 미국 종목: AAPL -> aapl.us
+    return f"{us_symbol.lower()}.us"
+
+
+def fetch_stooq_daily(us_symbol: str, keep_last: int = KEEP_LAST):
+    """
+    Stooq CSV (daily):
+      https://stooq.com/q/d/l/?s=aapl.us&i=d
+    Columns: Date,Open,High,Low,Close,Volume
+    We sort by Date and keep only latest keep_last rows.
+    """
+    params = {"s": to_stooq_symbol(us_symbol), "i": "d"}
+    r = requests.get(STOOQ_BASE, params=params, timeout=30)
+    r.raise_for_status()
+
+    text = r.text.strip()
+    if not text or "No data" in text:
+        raise RuntimeError(f"{us_symbol}: no data from stooq")
+
+    reader = csv.DictReader(StringIO(text))
+    rows = [row for row in reader if row.get("Date")]
+
+    if len(rows) < 10:
+        raise RuntimeError(f"{us_symbol}: insufficient rows ({len(rows)})")
+
+    rows.sort(key=lambda x: x["Date"])
+    rows = rows[-keep_last:]
+
+    dates, o, h, l, c, v = [], [], [], [], [], []
+    for row in rows:
+        dates.append(row["Date"])
+        o.append(float(row["Open"]))
+        h.append(float(row["High"]))
+        l.append(float(row["Low"]))
+        c.append(float(row["Close"]))
+        v.append(int(float(row["Volume"])))
+
+    return dates, o, h, l, c, v
+
+
+def assert_csv_has_newlines(path: str, min_lines: int = 200):
+    """
+    GitHub raw / 일부 로더에서 '전체 1줄'로 인식되는 문제를 조기 감지.
+    최소 줄 수(min_lines) 미만이면 개행이 깨졌거나 저장이 비정상일 확률이 높음.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        s = f.read()
+    if s.count("\n") < min_lines:
+        raise RuntimeError(f"CSV newline seems broken: {path} (too few \\n)")
+
+
+def write_daily_csv(sym, dates, o, h, l, c, v, out_dir=CSV_DIR):
+    """
+    종목별 시계열(일봉 OHLCV)을 CSV로 저장 (차트용)
+    저장 경로: public/csv/{TICKER}_daily.csv
+
+    핵심: GitHub raw/여러 로더에서 1줄 인식 문제를 막기 위해
+         라인 종결자를 LF(\n)로 강제한다.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{sym.upper()}_daily.csv")
+
+    # newline="\n" + lineterminator="\n" 조합으로 '항상 LF' 고정
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(["Date", "Open", "High", "Low", "Close", "Volume"])
+        for i in range(len(dates)):
+            w.writerow([dates[i], o[i], h[i], l[i], c[i], v[i]])
+
+    return path
+
+
+def _iso_week_key(date_str: str):
+    dt = datetime(int(date_str[0:4]), int(date_str[5:7]), int(date_str[8:10]))
+    iso = dt.isocalendar()
+    return int(iso.year), int(iso.week)
+
+
+def resample_weekly(dates, o, h, l, c, v):
+    buckets = {}
+    for i, d in enumerate(dates):
+        key = _iso_week_key(d)
+        if key not in buckets:
+            buckets[key] = {"fi": i, "li": i, "high": h[i], "low": l[i], "vol": v[i]}
+        else:
+            b = buckets[key]
+            b["li"] = i
+            b["high"] = max(b["high"], h[i])
+            b["low"] = min(b["low"], l[i])
+            b["vol"] += v[i]
+
+    out_dates, out_o, out_h, out_l, out_c, out_v = [], [], [], [], [], []
+    for key in sorted(buckets.keys()):
+        b = buckets[key]
+        fi, li = b["fi"], b["li"]
+        out_dates.append(dates[li])  # last trading day of the week
+        out_o.append(o[fi])
+        out_h.append(b["high"])
+        out_l.append(b["low"])
+        out_c.append(c[li])
+        out_v.append(b["vol"])
+
+    return {"dates": out_dates, "open": out_o, "high": out_h, "low": out_l, "close": out_c, "volume": out_v}
+
+
+def resample_monthly(dates, o, h, l, c, v):
+    buckets = {}
+    for i, d in enumerate(dates):
+        key = (int(d[0:4]), int(d[5:7]))
+        if key not in buckets:
+            buckets[key] = {"fi": i, "li": i, "high": h[i], "low": l[i], "vol": v[i]}
+        else:
+            b = buckets[key]
+            b["li"] = i
+            b["high"] = max(b["high"], h[i])
+            b["low"] = min(b["low"], l[i])
+            b["vol"] += v[i]
+
+    out_dates, out_o, out_h, out_l, out_c, out_v = [], [], [], [], [], []
+    for key in sorted(buckets.keys()):
+        b = buckets[key]
+        fi, li = b["fi"], b["li"]
+        out_dates.append(dates[li])  # last trading day of the month
+        out_o.append(o[fi])
+        out_h.append(b["high"])
+        out_l.append(b["low"])
+        out_c.append(c[li])
+        out_v.append(b["vol"])
+
+    return {"dates": out_dates, "open": out_o, "high": out_h, "low": out_l, "close": out_c, "volume": out_v}
 
 
 def main():
-    tickers = load_tickers_from_txt(TICKERS_FILE)
-    params = DEFAULT_PARAMS.copy()
-
-    asof_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    tickers = read_tickers()
 
     report = {
-        "asof_utc": asof_utc,
+        "asof_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": "stooq",
-        "params": {
-            "rsi": params["rsi"],
-            "ema": params["ema"],
-            "sma": params["sma"],
-            "history_days_report": params["history_days_report"],
-            "history_days_csv": params["history_days_csv"],
-        },
+        "params": {"rsi": RSI_PERIOD, "ema": EMA_PERIOD, "sma": SMA_PERIOD},
         "tickers": {},
     }
 
-    errors = {}
-
-    for t in tickers:
+    for sym in tickers:
         try:
-            df = fetch_stooq_daily(t)
-
-            # CSV(5년) 저장
-            save_csv_5y(t, df, params["history_days_csv"])
-
-            # report entry(1년) 생성
-            report["tickers"][t] = build_report_entry(t, df, params)
-
+            dates, o, h, l, c, v = fetch_stooq_daily(sym, keep_last=KEEP_LAST)
         except Exception as e:
-            errors[t] = str(e)
+            report["tickers"][sym] = {"error": str(e)}
+            continue
 
-    if errors:
-        report["errors"] = errors
+        # ✅ 시계열 CSV 저장 (차트용) + 개행 검증
+        try:
+            csv_path = write_daily_csv(sym, dates, o, h, l, c, v, out_dir=CSV_DIR)
+            # 너무 짧은 시계열(예: 신규 상장) 대비해서 동적 임계치 적용
+            min_lines = max(30, min(200, len(dates) // 3))
+            assert_csv_has_newlines(csv_path, min_lines=min_lines)
+        except Exception as e:
+            # CSV 저장 실패/검증 실패는 report 생성 자체를 막지 않음(에러만 기록)
+            report["tickers"].setdefault(sym, {})
+            report["tickers"][sym]["csv_error"] = str(e)
 
-    (PUBLIC_DIR / "report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+        # ===== 거래량1용 last5 추가 =====
+        last5_vol = v[-5:] if len(v) >= 5 else v[:]
+        last5_dates = dates[-5:] if len(dates) >= 5 else dates[:]
+
+        prev_vol = v[-2] if len(v) >= 2 else None
+        vol_change_pct = None
+        if prev_vol and prev_vol != 0:
+            vol_change_pct = (v[-1] - prev_vol) / prev_vol * 100.0
+
+        daily_ind = compute_indicators(c)
+
+        w = resample_weekly(dates, o, h, l, c, v)
+        m = resample_monthly(dates, o, h, l, c, v)
+
+        weekly_ind = compute_indicators(w["close"]) if w["close"] else {"rsi14": None, "ema20": None, "sma60": None}
+        monthly_ind = compute_indicators(m["close"]) if m["close"] else {"rsi14": None, "ema20": None, "sma60": None}
+
+        report["tickers"][sym] = {
+            "daily": {
+                "last_date": dates[-1],
+                "last_close": c[-1],
+                "last_volume": v[-1],
+                "volumes_dates_last5": last5_dates,
+                "volumes_last5": last5_vol,
+                "prev_volume": prev_vol,
+                "vol_change_pct": vol_change_pct,
+                **daily_ind,
+            },
+            "weekly": {
+                "last_date": w["dates"][-1] if w["dates"] else None,
+                "last_close": w["close"][-1] if w["close"] else None,
+                "last_volume": w["volume"][-1] if w["volume"] else None,
+                **weekly_ind,
+            },
+            "monthly": {
+                "last_date": m["dates"][-1] if m["dates"] else None,
+                "last_close": m["close"][-1] if m["close"] else None,
+                "last_volume": m["volume"][-1] if m["volume"] else None,
+                **monthly_ind,
+            },
+        }
+
+    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+    with open(OUT_PATH, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
     main()
+```0
