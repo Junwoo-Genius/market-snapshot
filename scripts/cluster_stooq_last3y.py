@@ -12,7 +12,9 @@ from dateutil.relativedelta import relativedelta
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
-# ====== Universe (32) ======
+# =========================
+# CONFIG
+# =========================
 TICKERS = [
     "NVDA", "TSLA", "PLTR", "IREN", "BE", "ASTS", "CRCL", "HOOD", "OKLO", "NBIS", "ABAT", "AMD", "RGTI",
     "AAPL", "LLY", "SMR", "FLNC", "IONQ", "RIVN", "QBTS", "MU", "TSM", "INTC", "NVO", "RKLB", "ADBE",
@@ -20,51 +22,47 @@ TICKERS = [
 ]
 
 OUT_DIR = "public/cluster"
-os.makedirs(OUT_DIR, exist_ok=True)
+CSV_DIR = "public/csv"
 
-# ✅ Single stable source: CSV already generated in your repo
+# ✅ CSV 파일명 규칙(너가 고정한 형식): {TICKER}_daily.csv
 RAW_BASE = "https://raw.githubusercontent.com/Junwoo-Genius/market-snapshot/main/public/csv"
 
+# 네트워크 방어 파라미터
+HTTP_TIMEOUT = 25
+RETRIES = 4
+BACKOFF_BASE_SEC = 0.8  # 0.8, 1.6, 3.2, 6.4
+SLEEP_BETWEEN_TICKERS = 0.05
 
+# =========================
+# UTILS
+# =========================
 def now_utc_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
-def fetch_daily_from_github_raw(ticker: str):
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def is_probably_html(text_head: str) -> bool:
+    t = (text_head or "").lstrip().lower()
+    return t.startswith("<!doctype html") or t.startswith("<html") or "<html" in t[:2000]
+
+def validate_csv_header(text: str) -> bool:
     """
-    Source (fixed):
-      https://raw.githubusercontent.com/Junwoo-Genius/market-snapshot/main/public/csv/{TICKER}_daily.csv
-
-    Expect columns:
-      Date,Open,High,Low,Close,Volume
+    반드시 Date,Open,High,Low,Close,Volume 헤더가 있어야 CSV로 인정
     """
-    url = f"{RAW_BASE}/{ticker}_daily.csv"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; market-snapshot-bot/1.0)",
-        "Accept": "text/csv,*/*",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
+    if not text:
+        return False
+    first = text.splitlines()[0].strip().replace(" ", "")
+    return first.lower() == "date,open,high,low,close,volume"
 
-    r = requests.get(url, headers=headers, timeout=30)
-    status = r.status_code
-    head200 = (r.text[:200] if r.text else "")
-
-    # 실패 시에도 status/head200은 failed에 남길 수 있도록 예외 메시지에 포함
-    try:
-        r.raise_for_status()
-    except Exception as e:
-        raise RuntimeError(json.dumps({
-            "ticker": ticker,
-            "url": url,
-            "http_status": status,
-            "head200": head200,
-            "error": str(e),
-        }, ensure_ascii=False))
-
-    b = r.content
-    sha = hashlib.sha256(b).hexdigest()
-
+def read_csv_bytes_to_df(b: bytes, ticker: str) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(b))
     required = {"Date", "Close"}
     if not required.issubset(set(df.columns)):
@@ -76,34 +74,117 @@ def fetch_daily_from_github_raw(ticker: str):
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
+    if len(df) < 30:
+        raise RuntimeError(f"{ticker}: too few rows after parse ({len(df)})")
+    return df
 
-    meta = {
-        "ticker": ticker,
-        "source_url": url,
-        "download_time_utc": now_utc_iso(),
-        "http_status": status,
-        "bytes": len(b),
-        "sha256": sha,
-        "row_count": int(len(df)),
-        "date_range": [
-            df["Date"].min().strftime("%Y-%m-%d"),
-            df["Date"].max().strftime("%Y-%m-%d"),
-        ] if len(df) else None,
+# =========================
+# DATA LOADING (FINAL)
+# =========================
+def load_daily_df(ticker: str):
+    """
+    ✅ Final rule:
+    1) local public/csv/{TICKER}_daily.csv exists -> use it
+    2) else download from RAW_BASE/{TICKER}_daily.csv with retry/backoff/validation and save locally
+    """
+    os.makedirs(CSV_DIR, exist_ok=True)
+
+    local_path = os.path.join(CSV_DIR, f"{ticker}_daily.csv")
+    if os.path.exists(local_path):
+        # Local load
+        df = pd.read_csv(local_path)
+        required = {"Date", "Close"}
+        if not required.issubset(set(df.columns)):
+            raise RuntimeError(f"{ticker}: local csv missing columns {required - set(df.columns)}: {local_path}")
+
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
+
+        meta = {
+            "ticker": ticker,
+            "mode": "local",
+            "source_path": local_path,
+            "read_time_utc": now_utc_iso(),
+            "sha256": sha256_file(local_path),
+            "row_count": int(len(df)),
+            "date_range": [
+                df["Date"].min().strftime("%Y-%m-%d"),
+                df["Date"].max().strftime("%Y-%m-%d"),
+            ],
+        }
+        return df, meta
+
+    # Remote download
+    url = f"{RAW_BASE}/{ticker}_daily.csv"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; market-snapshot-bot/2.0)",
+        "Accept": "text/csv,*/*",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
-    return df, meta
 
+    last_err = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+            status = r.status_code
+            text_head = (r.text[:400] if r.text else "")
 
+            if status != 200:
+                raise RuntimeError(f"HTTP {status} (head={text_head[:120]!r})")
+
+            if is_probably_html(text_head):
+                raise RuntimeError(f"HTML response detected (head={text_head[:120]!r})")
+
+            text = r.text
+            if not validate_csv_header(text):
+                raise RuntimeError(f"Invalid CSV header (head={text_head[:120]!r})")
+
+            b = r.content
+            df = read_csv_bytes_to_df(b, ticker)
+
+            # Save to local cache (so next runs are network-free)
+            with open(local_path, "wb") as f:
+                f.write(b)
+
+            meta = {
+                "ticker": ticker,
+                "mode": "remote_then_saved",
+                "source_url": url,
+                "download_time_utc": now_utc_iso(),
+                "http_status": status,
+                "sha256": sha256_bytes(b),
+                "saved_path": local_path,
+                "row_count": int(len(df)),
+                "date_range": [
+                    df["Date"].min().strftime("%Y-%m-%d"),
+                    df["Date"].max().strftime("%Y-%m-%d"),
+                ],
+            }
+            return df, meta
+
+        except Exception as e:
+            last_err = str(e)
+            if attempt < RETRIES:
+                time.sleep(BACKOFF_BASE_SEC * (2 ** (attempt - 1)))
+            else:
+                break
+
+    raise RuntimeError(f"{ticker}: remote download failed after {RETRIES} retries: {last_err}")
+
+# =========================
+# INDICATORS / FEATURES
+# =========================
 def last_3y(df: pd.DataFrame):
-    if df.empty:
-        return df
     end = df["Date"].max()
     start = end - relativedelta(years=3)
     return df[df["Date"] >= start].copy().reset_index(drop=True)
 
-
 def ema(s: pd.Series, span: int) -> pd.Series:
     return s.ewm(span=span, adjust=False).mean()
-
 
 def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
     d = close.diff()
@@ -114,7 +195,6 @@ def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
     rs = roll_up / roll_down.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-
 def slope_pct(series: pd.Series, n: int) -> float:
     if len(series) < n + 1:
         return np.nan
@@ -124,12 +204,10 @@ def slope_pct(series: pd.Series, n: int) -> float:
         return np.nan
     return (b / a - 1.0) * 100.0
 
-
 def disparity_pct(x: float, ma: float) -> float:
     if pd.isna(x) or pd.isna(ma) or ma == 0:
         return np.nan
     return (x / ma - 1.0) * 100.0
-
 
 def to_weekly(df: pd.DataFrame) -> pd.DataFrame:
     w = df.set_index("Date").resample("W-FRI").agg({
@@ -141,7 +219,6 @@ def to_weekly(df: pd.DataFrame) -> pd.DataFrame:
     }).dropna().reset_index()
     return w
 
-
 def to_monthly(df: pd.DataFrame) -> pd.DataFrame:
     m = df.set_index("Date").resample("M").agg({
         "Open": "first",
@@ -152,11 +229,10 @@ def to_monthly(df: pd.DataFrame) -> pd.DataFrame:
     }).dropna().reset_index()
     return m
 
-
 def build_features(df_d: pd.DataFrame):
     """
     End = last3y 구간의 max Close(종가 최고점)
-    End 시점 기준으로 D/W/M의 slope/disp/rsi 산출
+    Slopes: D N=5, W N=4, M N=3/6
     """
     d = df_d.copy()
     d["EMA20"] = ema(d["Close"], 20)
@@ -177,6 +253,7 @@ def build_features(df_d: pd.DataFrame):
     m["EMA20"] = ema(m["Close"], 20)
     m["RSI14"] = rsi_wilder(m["Close"], 14)
 
+    # align end row
     w_end = w[w["Date"] >= end_date].head(1)
     if w_end.empty:
         w_end = w.tail(1)
@@ -189,8 +266,6 @@ def build_features(df_d: pd.DataFrame):
 
     feat = {}
 
-    # ===== Slopes (fixed) =====
-    # D: N=5, W: N=4, M: N=3/6 (as you previously locked in doc discussions)
     feat["D20_slope"] = slope_pct(d.loc[:end_idx, "EMA20"].tail(260), 5)
     feat["D60_slope"] = slope_pct(d.loc[:end_idx, "EMA60"].tail(400), 5)
     feat["D_diff"] = feat["D20_slope"] - feat["D60_slope"]
@@ -201,7 +276,6 @@ def build_features(df_d: pd.DataFrame):
     feat["M3_slope"] = slope_pct(m[m["Date"] <= m_end_row["Date"]]["EMA20"].tail(60), 3)
     feat["M6_slope"] = slope_pct(m[m["Date"] <= m_end_row["Date"]]["EMA20"].tail(80), 6)
 
-    # ===== Disparity 7 =====
     feat["d_DISP20"] = disparity_pct(end_close, float(end["EMA20"]))
     feat["d_DISP60"] = disparity_pct(end_close, float(end["EMA60"]))
     feat["D_SPREAD"] = disparity_pct(float(end["EMA20"]), float(end["EMA60"]))
@@ -212,17 +286,13 @@ def build_features(df_d: pd.DataFrame):
 
     feat["M_DISP20"] = disparity_pct(float(m_end_row["Close"]), float(m_end_row["EMA20"]))
 
-    # ===== RSI =====
-    feat["D_RSI_END"] = float(w_end_row["RSI14"] * 0 + end["RSI14"])  # force float
+    feat["D_RSI_END"] = float(end["RSI14"])
     feat["W_RSI_END"] = float(w_end_row["RSI14"])
     feat["M_RSI_END"] = float(m_end_row["RSI14"])
 
-    # ===== End meta =====
     feat["_END_DATE"] = end_date.strftime("%Y-%m-%d")
     feat["_END_CLOSE"] = float(end_close)
-
     return feat
-
 
 def percentile_dict(arr: np.ndarray):
     return {
@@ -233,15 +303,22 @@ def percentile_dict(arr: np.ndarray):
         "P90": float(np.nanpercentile(arr, 90)),
     }
 
-
+# =========================
+# MAIN
+# =========================
 def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(CSV_DIR, exist_ok=True)
+
     run_meta = {
         "run_time_utc": now_utc_iso(),
-        "source": "github_raw_daily_csv",
-        "source_pattern": f"{RAW_BASE}/{{TICKER}}_daily.csv",
+        "source_policy": "local_first_then_raw_download_save",
+        "raw_base": RAW_BASE,
+        "csv_dir": CSV_DIR,
         "universe": TICKERS,
         "window": "last_3y",
         "k": 5,
+        "network": {"timeout": HTTP_TIMEOUT, "retries": RETRIES, "backoff_base_sec": BACKOFF_BASE_SEC},
         "features": [
             "D20_slope", "D60_slope", "D_diff",
             "W20_slope", "W60_slope",
@@ -250,32 +327,39 @@ def main():
             "w_DISP20", "w_DISP60", "w_SPREAD",
             "M_DISP20",
             "D_RSI_END", "W_RSI_END", "M_RSI_END"
-        ]
+        ],
     }
 
     metas, rows, failed = [], [], []
 
+    # evidence: what local files exist right now
+    local_files = sorted([f for f in os.listdir(CSV_DIR) if f.endswith("_daily.csv")]) if os.path.isdir(CSV_DIR) else []
+    run_meta["local_csv_files_count"] = len(local_files)
+    run_meta["local_csv_files_sample"] = local_files[:25]
+
     for t in TICKERS:
         try:
-            df, meta = fetch_daily_from_github_raw(t)
+            df, meta = load_daily_df(t)
             df3 = last_3y(df)
+
             meta["last3y_row_count"] = int(len(df3))
             meta["last3y_date_range"] = [
                 df3["Date"].min().strftime("%Y-%m-%d"),
                 df3["Date"].max().strftime("%Y-%m-%d"),
-            ] if len(df3) else None
+            ]
 
-            f = build_features(df3)
-            f["Ticker"] = t
-            rows.append(f)
+            feat = build_features(df3)
+            feat["Ticker"] = t
+
+            rows.append(feat)
             metas.append(meta)
 
         except Exception as e:
             failed.append({"ticker": t, "error": str(e)})
 
-        time.sleep(0.1)
+        time.sleep(SLEEP_BETWEEN_TICKERS)
 
-    # 항상 증거 저장
+    # always write evidence
     with open(os.path.join(OUT_DIR, "run_meta.json"), "w", encoding="utf-8") as f:
         json.dump(run_meta, f, ensure_ascii=False, indent=2)
 
@@ -283,10 +367,12 @@ def main():
         json.dump({"tickers": metas, "failed": failed}, f, ensure_ascii=False, indent=2)
 
     if len(rows) == 0:
-        raise SystemExit("All tickers failed to download from GitHub RAW daily.csv. Check public/cluster/source_fingerprints.json")
+        # hard stop with evidence already written
+        raise SystemExit(
+            "All tickers failed. Check public/cluster/source_fingerprints.json for per-ticker error evidence."
+        )
 
     feat_df = pd.DataFrame(rows).set_index("Ticker")
-
     feature_cols = [c for c in run_meta["features"] if not c.startswith("_")]
     X = feat_df[feature_cols].replace([np.inf, -np.inf], np.nan).dropna()
 
@@ -295,11 +381,10 @@ def main():
 
     run_meta["used_count"] = len(used)
     run_meta["dropped_count"] = len(dropped)
-    run_meta["failed_fetch_count"] = len(failed)
-    run_meta["dropped_tickers"] = dropped
+    run_meta["failed_count"] = len(failed)
     run_meta["failed_tickers"] = [x["ticker"] for x in failed]
+    run_meta["dropped_tickers"] = dropped
 
-    # update meta with counts
     with open(os.path.join(OUT_DIR, "run_meta.json"), "w", encoding="utf-8") as f:
         json.dump(run_meta, f, ensure_ascii=False, indent=2)
 
@@ -312,7 +397,7 @@ def main():
     out = X.copy()
     out["Cluster"] = labels
 
-    # (1) numeric bands
+    # numeric bands per cluster
     bands = {}
     for cl in sorted(out["Cluster"].unique()):
         sub = out[out["Cluster"] == cl]
@@ -335,44 +420,15 @@ def main():
         "optional_next3": optional
     }
 
-    # score-based
-    centers = kmeans.cluster_centers_
-
-    def score_one(xrow: np.ndarray):
-        xs = scaler.transform([xrow])[0]
-        dists = np.linalg.norm(centers - xs, axis=1)
-        mx, mn = float(dists.max()), float(dists.min())
-        scores = (mx - dists) / (mx - mn + 1e-9) * 100.0
-        order = np.argsort(scores)[::-1]
-        c1, c2 = int(order[0]), int(order[1])
-        return c1, float(scores[c1]), c2, float(scores[c2]), float(scores[c1] - scores[c2])
-
-    scores_rows = []
-    for tkr in used:
-        c1, s1, c2, s2, delta = score_one(X.loc[tkr].to_numpy())
-        scores_rows.append({
-            "Ticker": tkr,
-            "Top1_Cluster": c1,
-            "Top1_Score": s1,
-            "Top2_Cluster": c2,
-            "Top2_Score": s2,
-            "Delta": delta
-        })
-    scores_df = pd.DataFrame(scores_rows).sort_values(["Top1_Score", "Delta"], ascending=[False, False])
-
-    # outputs
+    # save outputs
     assign = out[["Cluster"]].copy()
     assign = assign.join(feat_df[["_END_DATE", "_END_CLOSE"]], how="left")
 
     assign.to_csv(os.path.join(OUT_DIR, "cluster_assign.csv"), encoding="utf-8")
-    scores_df.to_csv(os.path.join(OUT_DIR, "cluster_scores.csv"), index=False, encoding="utf-8")
-
     with open(os.path.join(OUT_DIR, "cluster_bands.json"), "w", encoding="utf-8") as f:
         json.dump(bands, f, ensure_ascii=False, indent=2)
-
     with open(os.path.join(OUT_DIR, "cluster_rule2_essential_optional.json"), "w", encoding="utf-8") as f:
         json.dump(rule2, f, ensure_ascii=False, indent=2)
-
 
 if __name__ == "__main__":
     main()
