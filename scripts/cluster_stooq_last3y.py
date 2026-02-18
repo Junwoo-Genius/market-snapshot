@@ -20,14 +20,9 @@ TICKERS = [
 ]
 
 # =========================
-# PATH RESOLUTION (HARD FIX)
+# PATH RESOLUTION
 # =========================
-def find_repo_root():
-    """
-    어떤 working-directory에서도 'repo root'를 확정.
-    - 1순위: GITHUB_WORKSPACE
-    - 2순위: 현재 경로에서 상위로 올라가며 'public/csv' 존재 여부 탐색
-    """
+def find_repo_root() -> str:
     gw = os.environ.get("GITHUB_WORKSPACE")
     if gw and os.path.isdir(gw):
         return os.path.abspath(gw)
@@ -48,13 +43,12 @@ OUT_DIR = os.path.join(ROOT, "public", "cluster")
 CSV_DIR = os.path.join(ROOT, "public", "csv")
 
 def csv_path(ticker: str) -> str:
-    # 파일명 형식 고정: public/csv/BE_daily.csv
     return os.path.join(CSV_DIR, f"{ticker}_daily.csv")
 
 # =========================
 # UTILS
 # =========================
-def now_utc_iso():
+def now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 def sha256_file(path: str) -> str:
@@ -64,10 +58,7 @@ def sha256_file(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def hard_print_env_and_fs():
-    """
-    워크플로우 수정 없이, 로그만 보고 원인 확정되도록 stdout 강제 출력.
-    """
+def hard_print_env_and_fs() -> None:
     print("=== CLUSTER DEBUG START ===")
     print("UTC:", now_utc_iso())
     print("CWD:", os.path.abspath(os.getcwd()))
@@ -97,10 +88,11 @@ def hard_print_env_and_fs():
         print(f"try_open {t} -> {p} exists={os.path.exists(p)}")
         if os.path.exists(p):
             try:
-                df = pd.read_csv(p, nrows=5)
-                print(f"{t} head columns:", list(df.columns))
+                dfh = pd.read_csv(p, nrows=5)
+                print(f"{t} head columns:", list(dfh.columns))
             except Exception as e:
                 print(f"{t} read_csv ERROR:", repr(e))
+
     print("=== CLUSTER DEBUG END ===\n")
 
 # =========================
@@ -115,7 +107,7 @@ def read_local_daily(ticker: str):
     required = {"Date", "Open", "High", "Low", "Close", "Volume"}
     missing = required - set(df.columns)
     if missing:
-        raise RuntimeError(f"{ticker}: local csv missing columns {missing} -> {path}")
+        raise RuntimeError(f"{ticker}: local csv missing columns {sorted(list(missing))} -> {path}")
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     for col in ["Open", "High", "Low", "Close", "Volume"]:
@@ -140,7 +132,7 @@ def read_local_daily(ticker: str):
 # =========================
 # INDICATORS / FEATURES
 # =========================
-def last_3y(df: pd.DataFrame):
+def last_3y(df: pd.DataFrame) -> pd.DataFrame:
     end = df["Date"].max()
     start = end - relativedelta(years=3)
     return df[df["Date"] >= start].copy().reset_index(drop=True)
@@ -172,33 +164,24 @@ def disparity_pct(x: float, ma: float) -> float:
     return (x / ma - 1.0) * 100.0
 
 def to_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    w = df.set_index("Date").resample("W-FRI").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum"
-    }).dropna().reset_index()
+    w = df.set_index("Date").resample("W-FRI").agg(
+        {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    ).dropna().reset_index()
     return w
 
 def to_monthly(df: pd.DataFrame) -> pd.DataFrame:
-    # NOTE: 'M'는 월말. pandas 2.x에서도 동작.
-    m = df.set_index("Date").resample("M").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum"
-    }).dropna().reset_index()
+    # ✅ FIX: pandas 환경에서 'M'이 막혀서 'ME'(month-end) 사용
+    m = df.set_index("Date").resample("ME").agg(
+        {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    ).dropna().reset_index()
     return m
 
-def build_features(df_d: pd.DataFrame):
+def build_features(df_d: pd.DataFrame) -> dict:
     d = df_d.copy()
     d["EMA20"] = ema(d["Close"], 20)
     d["EMA60"] = ema(d["Close"], 60)
     d["RSI14"] = rsi_wilder(d["Close"], 14)
 
-    # 최고 종가(End)
     end_idx = d["Close"].idxmax()
     end = d.loc[end_idx]
     end_date = end["Date"]
@@ -213,7 +196,6 @@ def build_features(df_d: pd.DataFrame):
     m["EMA20"] = ema(m["Close"], 20)
     m["RSI14"] = rsi_wilder(m["Close"], 14)
 
-    # End에 대응되는 주/월 행 선택(End 이후 첫 행, 없으면 마지막)
     w_end = w[w["Date"] >= end_date].head(1)
     if w_end.empty:
         w_end = w.tail(1)
@@ -226,7 +208,7 @@ def build_features(df_d: pd.DataFrame):
 
     feat = {}
 
-    # 기울기(고정): D N=5, W N=4, M N=3/6
+    # slopes (fixed): D N=5, W N=4, M N=3/6
     feat["D20_slope"] = slope_pct(d.loc[:end_idx, "EMA20"].tail(260), 5)
     feat["D60_slope"] = slope_pct(d.loc[:end_idx, "EMA60"].tail(400), 5)
     feat["D_diff"] = feat["D20_slope"] - feat["D60_slope"]
@@ -237,7 +219,7 @@ def build_features(df_d: pd.DataFrame):
     feat["M3_slope"] = slope_pct(m[m["Date"] <= m_end_row["Date"]]["EMA20"].tail(60), 3)
     feat["M6_slope"] = slope_pct(m[m["Date"] <= m_end_row["Date"]]["EMA20"].tail(80), 6)
 
-    # 이격도/스프레드 (End 기준)
+    # disparities/spreads (End-based)
     feat["d_DISP20"] = disparity_pct(end_close, float(end["EMA20"]))
     feat["d_DISP60"] = disparity_pct(end_close, float(end["EMA60"]))
     feat["D_SPREAD"] = disparity_pct(float(end["EMA20"]), float(end["EMA60"]))
@@ -248,18 +230,16 @@ def build_features(df_d: pd.DataFrame):
 
     feat["M_DISP20"] = disparity_pct(float(m_end_row["Close"]), float(m_end_row["EMA20"]))
 
-    # RSI (End 기준)
+    # RSI
     feat["D_RSI_END"] = float(end["RSI14"]) if not pd.isna(end["RSI14"]) else np.nan
     feat["W_RSI_END"] = float(w_end_row["RSI14"]) if not pd.isna(w_end_row["RSI14"]) else np.nan
     feat["M_RSI_END"] = float(m_end_row["RSI14"]) if not pd.isna(m_end_row["RSI14"]) else np.nan
 
-    # meta
     feat["_END_DATE"] = end_date.strftime("%Y-%m-%d")
     feat["_END_CLOSE"] = float(end_close)
-
     return feat
 
-def percentile_dict(arr: np.ndarray):
+def percentile_dict(arr: np.ndarray) -> dict:
     return {
         "P10": float(np.nanpercentile(arr, 10)),
         "P25": float(np.nanpercentile(arr, 25)),
@@ -274,53 +254,46 @@ def percentile_dict(arr: np.ndarray):
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    # 1) 환경/파일 상태 출력
     hard_print_env_and_fs()
 
-    metas, rows, failed = [], [], []
+    rows = []
+    failed = []
 
     for t in TICKERS:
         try:
-            df, meta = read_local_daily(t)
+            df, _meta = read_local_daily(t)
             df3 = last_3y(df)
-
-            # 최소 길이(3년 창이라도 너무 짧으면 제외)
             if len(df3) < 60:
-                raise RuntimeError(f"{t}: last_3y rows too few ({len(df3)})")
+                raise RuntimeError(f"{t}: last_3y too short ({len(df3)})")
 
-            meta["last3y_rows"] = int(len(df3))
             f = build_features(df3)
             f["Ticker"] = t
-
             rows.append(f)
-            metas.append(meta)
 
         except Exception as e:
             failed.append({"ticker": t, "path": csv_path(t), "error": repr(e)})
 
         time.sleep(0.005)
 
-    # 2) 실패/성공 증거는 항상 stdout로도 남긴다(레포 커밋 불필요)
     print(f"\nSUMMARY: ok={len(rows)} failed={len(failed)} universe={len(TICKERS)}")
 
     if len(rows) == 0:
         print("\n=== FAILED SAMPLE (top 10) ===")
         for x in failed[:10]:
-            print(x["ticker"], "->", x.get("error"))
+            print(x["ticker"], "->", x["error"])
         print("=== FAILED SAMPLE END ===\n")
         raise SystemExit("All tickers failed.")
 
-    # 3) 클러스터링
     feat_df = pd.DataFrame(rows).set_index("Ticker")
 
     feature_cols = [c for c in feat_df.columns if not c.startswith("_")]
     X = feat_df[feature_cols].replace([np.inf, -np.inf], np.nan).dropna()
 
     if len(X) < 5:
-        print("\n=== INVALID FEATURE ROWS (top 10) ===")
-        # 어떤 티커가 빠지는지 확인
         dropped = sorted(set(feat_df.index) - set(X.index))
-        print("dropped:", dropped[:10], " ... total=", len(dropped))
+        print("\n=== INVALID FEATURE ROWS (top 10) ===")
+        print("valid:", len(X), "dropped:", len(dropped))
+        print("dropped sample:", dropped[:10])
         print("=== INVALID FEATURE ROWS END ===\n")
         raise SystemExit(f"Not enough valid rows for K=5 clustering. valid={len(X)}")
 
