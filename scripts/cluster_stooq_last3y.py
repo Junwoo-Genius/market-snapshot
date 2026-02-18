@@ -2,7 +2,9 @@ import io
 import os
 import json
 import time
+import csv
 import hashlib
+from io import StringIO
 from datetime import datetime, timezone
 
 import numpy as np
@@ -12,7 +14,7 @@ from dateutil.relativedelta import relativedelta
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
-# ====== 사용자 지정: 32종목 ======
+# ====== 학습 대상 32종목 ======
 TICKERS = [
     "NVDA", "TSLA", "PLTR", "IREN", "BE", "ASTS", "CRCL", "HOOD", "OKLO", "NBIS", "ABAT", "AMD", "RGTI",
     "AAPL", "LLY", "SMR", "FLNC", "IONQ", "RIVN", "QBTS", "MU", "TSM", "INTC", "NVO", "RKLB", "ADBE",
@@ -22,67 +24,83 @@ TICKERS = [
 OUT_DIR = "public/cluster"
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# Stooq base (기존 코드 방식과 통일)
+STOOQ_BASE = "https://stooq.com/q/d/l/"
+
 
 def now_utc_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def fetch_stooq_daily(ticker: str):
-    """
-    Stooq CSV 다운로드.
-    - User-Agent 헤더 필수(차단/403 완화)
-    - stooq.com 실패 시 stooq.pl로 폴백
-    - 각 URL 3회 재시도(백오프)
-    """
-    sym = f"{ticker.lower()}.us"
+def to_stooq_symbol(us_symbol: str) -> str:
+    # 미국 종목: AAPL -> aapl.us
+    return f"{us_symbol.lower()}.us"
 
-    urls = [
-        f"https://stooq.com/q/d/l/?s={sym}&i=d",
-        f"https://stooq.pl/q/d/l/?s={sym}&i=d",
-    ]
 
+def fetch_stooq_daily_like_botpy(us_symbol: str):
+    """
+    ✅ 기존 bot.py와 동일한 방식으로 Stooq CSV를 수신/파싱한다.
+    - requests.get(STOOQ_BASE, params=...)
+    - r.text 기반
+    - csv.DictReader(StringIO(text))
+    """
+    params = {"s": to_stooq_symbol(us_symbol), "i": "d"}
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; market-snapshot-bot/1.0; +https://github.com/Junwoo-Genius/market-snapshot)",
+        # bot.py는 UA 없이도 되었지만, 안전상 UA 추가(동작에 영향 거의 없음)
+        "User-Agent": "Mozilla/5.0 (compatible; market-snapshot-bot/1.0)",
         "Accept": "text/csv,*/*",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 
-    last_err = None
-    for url in urls:
-        for attempt in range(1, 4):  # 3회 재시도
-            try:
-                r = requests.get(url, headers=headers, timeout=30)
-                r.raise_for_status()
+    r = requests.get(STOOQ_BASE, params=params, headers=headers, timeout=30)
 
-                b = r.content
-                sha = hashlib.sha256(b).hexdigest()
+    status = r.status_code
+    text = (r.text or "").strip()
+    head200 = text[:200] if text else ""
 
-                df = pd.read_csv(io.BytesIO(b))
-                if "Date" not in df.columns or "Close" not in df.columns:
-                    raise ValueError(f"CSV columns unexpected: {df.columns.tolist()[:10]}")
+    # 상태코드가 비정상이면 raise
+    r.raise_for_status()
 
-                df["Date"] = pd.to_datetime(df["Date"], utc=False)
-                df = df.sort_values("Date").reset_index(drop=True)
+    if not text or "No data" in text:
+        raise RuntimeError(f"{us_symbol}: no data from stooq")
 
-                meta = {
-                    "ticker": ticker,
-                    "sym": sym,
-                    "source_url": url,
-                    "download_time_utc": now_utc_iso(),
-                    "bytes": len(b),
-                    "sha256": sha,
-                    "row_count": int(len(df)),
-                    "date_range": [
-                        df["Date"].min().strftime("%Y-%m-%d"),
-                        df["Date"].max().strftime("%Y-%m-%d"),
-                    ] if len(df) else None,
-                }
-                return df, meta
+    reader = csv.DictReader(StringIO(text))
+    rows = [row for row in reader if row.get("Date")]
 
-            except Exception as e:
-                last_err = e
-                time.sleep(1.5 * attempt)
+    if len(rows) < 10:
+        raise RuntimeError(f"{us_symbol}: insufficient rows ({len(rows)})")
 
-    raise RuntimeError(f"Stooq download failed for {ticker} ({sym}). last_err={last_err}")
+    rows.sort(key=lambda x: x["Date"])
+
+    # DataFrame 변환 + 타입 정규화
+    df = pd.DataFrame(rows)
+    df["Date"] = pd.to_datetime(df["Date"], utc=False)
+
+    # 숫자 변환(비정상 값은 NaN)
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
+
+    # fingerprint
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    meta = {
+        "ticker": us_symbol,
+        "sym": to_stooq_symbol(us_symbol),
+        "source_url": f"{STOOQ_BASE}?s={to_stooq_symbol(us_symbol)}&i=d",
+        "download_time_utc": now_utc_iso(),
+        "http_status": status,
+        "head200": head200,
+        "sha256": sha,
+        "row_count": int(len(df)),
+        "date_range": [
+            df["Date"].min().strftime("%Y-%m-%d"),
+            df["Date"].max().strftime("%Y-%m-%d"),
+        ] if len(df) else None,
+    }
+    return df, meta
 
 
 def last_3y(df: pd.DataFrame):
@@ -109,6 +127,7 @@ def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
 
 
 def slope_pct(series: pd.Series, n: int) -> float:
+    # n기간 전 대비 %
     if len(series) < n + 1:
         return np.nan
     a = series.iloc[-n - 1]
@@ -147,41 +166,45 @@ def to_monthly(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_features(df_d: pd.DataFrame):
-    # ===== D =====
+    """
+    End = 최근 3년 구간 내 max Close(종가 최고점)
+    그 End 시점 기준으로 D/W/M 지표 산출
+    """
     d = df_d.copy()
     d["EMA20"] = ema(d["Close"], 20)
     d["EMA60"] = ema(d["Close"], 60)
     d["RSI14"] = rsi_wilder(d["Close"], 14)
 
-    # End: 최근 3년 구간 내 max Close
+    # End
     end_idx = d["Close"].idxmax()
     end = d.loc[end_idx]
     end_date = end["Date"]
     end_close = float(end["Close"])
 
-    # ===== W =====
+    # Weekly / Monthly
     w = to_weekly(d)
     w["EMA20"] = ema(w["Close"], 20)
     w["EMA60"] = ema(w["Close"], 60)
     w["RSI14"] = rsi_wilder(w["Close"], 14)
 
+    m = to_monthly(d)
+    m["EMA20"] = ema(m["Close"], 20)
+    m["RSI14"] = rsi_wilder(m["Close"], 14)
+
+    # End 시점 이후 첫 주/월 바 찾기(없으면 마지막)
     w_end = w[w["Date"] >= end_date].head(1)
     if w_end.empty:
         w_end = w.tail(1)
     w_end_row = w_end.iloc[0]
-
-    # ===== M =====
-    m = to_monthly(d)
-    m["EMA20"] = ema(m["Close"], 20)
-    m["RSI14"] = rsi_wilder(m["Close"], 14)
 
     m_end = m[m["Date"] >= end_date].head(1)
     if m_end.empty:
         m_end = m.tail(1)
     m_end_row = m_end.iloc[0]
 
-    # ===== Slope (D N=5 / W N=4 / M N=3,6) =====
     feat = {}
+
+    # ===== Slope (D N=5 / W N=4 / M N=3,6) =====
     feat["D20_slope"] = slope_pct(d.loc[:end_idx, "EMA20"].tail(260), 5)
     feat["D60_slope"] = slope_pct(d.loc[:end_idx, "EMA60"].tail(400), 5)
     feat["D_diff"] = feat["D20_slope"] - feat["D60_slope"]
@@ -203,7 +226,7 @@ def build_features(df_d: pd.DataFrame):
 
     feat["M_DISP20"] = disparity_pct(float(m_end_row["Close"]), float(m_end_row["EMA20"]))
 
-    # ===== RSI (single) =====
+    # ===== RSI =====
     feat["D_RSI_END"] = float(end["RSI14"])
     feat["W_RSI_END"] = float(w_end_row["RSI14"])
     feat["M_RSI_END"] = float(m_end_row["RSI14"])
@@ -213,6 +236,7 @@ def build_features(df_d: pd.DataFrame):
     feat["_END_CLOSE"] = end_close
     feat["_W_END_DATE"] = w_end_row["Date"].strftime("%Y-%m-%d")
     feat["_M_END_DATE"] = m_end_row["Date"].strftime("%Y-%m-%d")
+
     return feat
 
 
@@ -229,14 +253,18 @@ def percentile_dict(arr: np.ndarray):
 def main():
     run_meta = {
         "run_time_utc": now_utc_iso(),
-        "source": "stooq_csv",
-        "source_pattern": "https://stooq.com/q/d/l/?s={ticker}.us&i=d (fallback: stooq.pl)",
+        "source": "stooq_csv(botpy-compatible)",
+        "source_pattern": f"{STOOQ_BASE}?s={{ticker}}.us&i=d",
         "universe": TICKERS,
         "window": "last_3y",
         "k": 5,
         "features": [
-            "D20_slope", "D60_slope", "D_diff", "W20_slope", "W60_slope", "M3_slope", "M6_slope",
-            "d_DISP20", "d_DISP60", "D_SPREAD", "w_DISP20", "w_DISP60", "w_SPREAD", "M_DISP20",
+            "D20_slope", "D60_slope", "D_diff",
+            "W20_slope", "W60_slope",
+            "M3_slope", "M6_slope",
+            "d_DISP20", "d_DISP60", "D_SPREAD",
+            "w_DISP20", "w_DISP60", "w_SPREAD",
+            "M_DISP20",
             "D_RSI_END", "W_RSI_END", "M_RSI_END"
         ]
     }
@@ -247,7 +275,7 @@ def main():
 
     for t in TICKERS:
         try:
-            df, meta = fetch_stooq_daily(t)
+            df, meta = fetch_stooq_daily_like_botpy(t)
             df3 = last_3y(df)
             meta["last3y_row_count"] = int(len(df3))
             meta["last3y_date_range"] = [
@@ -261,7 +289,14 @@ def main():
             metas.append(meta)
 
         except Exception as e:
-            failed.append({"ticker": t, "error": str(e)})
+            # 정확한 실패 채증(HTTP status/head200 포함은 meta에 이미 있음)
+            failed.append({
+                "ticker": t,
+                "error": str(e),
+            })
+
+        # 레이트리밋/봇차단 방지: 기존 bot.py는 빠르게 돌아도 되지만, 학습은 32개 연속이므로 아주 미세 딜레이
+        time.sleep(0.25)
 
     # rows가 0이면 즉시 중단 + 실패 리포트 저장
     if len(rows) == 0:
@@ -276,7 +311,7 @@ def main():
             json.dump({"tickers": metas, "failed": failed}, f, ensure_ascii=False, indent=2)
 
         raise SystemExit(
-            "All tickers failed to download from Stooq (both .com and .pl). "
+            "All tickers failed to download/parse from Stooq with botpy-compatible fetch. "
             "Check public/cluster/source_fingerprints.json for details."
         )
 
@@ -377,7 +412,7 @@ def main():
 
     # README
     readme = []
-    readme.append("# Cluster 5 Groups (Stooq, last 3y)")
+    readme.append("# Cluster 5 Groups (Stooq, last 3y) — botpy-compatible fetch")
     readme.append(f"- run_time_utc: {run_meta['run_time_utc']}")
     readme.append(f"- used: {run_meta['used_count']} / {len(TICKERS)} (dropped={run_meta['dropped_count']}, failed_fetch={run_meta['failed_fetch_count']})")
     readme.append("")
