@@ -1,16 +1,13 @@
 import os
 import json
 import csv
-import requests
-from io import StringIO
 from datetime import datetime, timezone
+import yfinance as yf
 
 # ===== Parameters (fixed) =====
 RSI_PERIOD = 14
 EMA_PERIOD = 20
 SMA_PERIOD = 60
-
-STOOQ_BASE = "https://stooq.com/q/d/l/"
 
 TICKERS_FILE = os.environ.get("TICKERS_FILE", "tickers.txt")
 OUT_PATH = os.environ.get("OUT_PATH", "public/report.json")
@@ -18,9 +15,8 @@ OUT_PATH = os.environ.get("OUT_PATH", "public/report.json")
 # CSV 저장 위치 (차트/시계열용)
 CSV_DIR = os.environ.get("CSV_DIR", "public/csv")
 
-# stooq에서 가져올 최대 행 수 (넉넉히)
+# yfinance에서 가져올 최대 행 수
 KEEP_LAST = int(os.environ.get("KEEP_LAST", "5000"))
-
 
 def read_tickers(path=TICKERS_FILE):
     out = []
@@ -31,12 +27,10 @@ def read_tickers(path=TICKERS_FILE):
                 out.append(s.upper())
     return out
 
-
 def sma(values, period):
     if len(values) < period:
         return None
     return sum(values[-period:]) / period
-
 
 def ema(values, period):
     if len(values) < period:
@@ -46,7 +40,6 @@ def ema(values, period):
     for v in values[1:]:
         e = v * k + e * (1 - k)
     return e
-
 
 def rsi(values, period=14):
     # Wilder's RSI (TradingView-style smoothing)
@@ -73,7 +66,6 @@ def rsi(values, period=14):
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
-
 def compute_indicators(close_series):
     return {
         "rsi14": rsi(close_series, RSI_PERIOD),
@@ -81,49 +73,34 @@ def compute_indicators(close_series):
         "sma60": sma(close_series, SMA_PERIOD),
     }
 
-
-def to_stooq_symbol(us_symbol: str) -> str:
-    # 미국 종목: AAPL -> aapl.us
-    return f"{us_symbol.lower()}.us"
-
-
-def fetch_stooq_daily(us_symbol: str, keep_last: int = KEEP_LAST):
+def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
     """
-    Stooq CSV (daily):
-      https://stooq.com/q/d/l/?s=aapl.us&i=d
-    Columns: Date,Open,High,Low,Close,Volume
-    We sort by Date and keep only latest keep_last rows.
+    yfinance 라이브러리를 사용하여 야후 파이낸스에서 일봉 OHLCV 데이터를 수집합니다.
     """
-    params = {"s": to_stooq_symbol(us_symbol), "i": "d"}
-    r = requests.get(STOOQ_BASE, params=params, timeout=30)
-    r.raise_for_status()
-
-    text = r.text.strip()
-    if not text or "No data" in text:
-        raise RuntimeError(f"{us_symbol}: no data from stooq")
-
-    reader = csv.DictReader(StringIO(text))
-    rows = [row for row in reader if row.get("Date")]
-
-    if len(rows) < 10:
-        raise RuntimeError(f"{us_symbol}: insufficient rows ({len(rows)})")
-
-    rows.sort(key=lambda x: x["Date"])
-    rows = rows[-keep_last:]
+    ticker = yf.Ticker(symbol)
+    
+    # max 기간으로 호출하여 분할/배당 보정된 전체 데이터를 가져온 후 필요한 만큼 자릅니다.
+    df = ticker.history(period="max")
+    
+    if df.empty:
+        raise RuntimeError(f"{symbol}: no data from yfinance")
+        
+    df = df.tail(keep_last)
+    
+    if len(df) < 10:
+        raise RuntimeError(f"{symbol}: insufficient rows ({len(df)})")
 
     dates, o, h, l, c, v = [], [], [], [], [], []
-    for row in rows:
-        dates.append(row["Date"])
+    for index, row in df.iterrows():
+        # yfinance index는 Datetime이므로 문자열로 변환 (stooq과 동일한 포맷)
+        dates.append(index.strftime("%Y-%m-%d"))
         o.append(float(row["Open"]))
         h.append(float(row["High"]))
         l.append(float(row["Low"]))
         c.append(float(row["Close"]))
-        # stooq volume이 비어있거나 소수로 오는 경우 방어
-        vol_raw = row.get("Volume", "0")
-        v.append(int(float(vol_raw)) if vol_raw not in (None, "") else 0)
+        v.append(int(row["Volume"]))
 
     return dates, o, h, l, c, v
-
 
 def write_daily_csv(sym, dates, o, h, l, c, v, out_dir=CSV_DIR):
     """
@@ -139,12 +116,10 @@ def write_daily_csv(sym, dates, o, h, l, c, v, out_dir=CSV_DIR):
             w.writerow([dates[i], o[i], h[i], l[i], c[i], v[i]])
     return path
 
-
 def _iso_week_key(date_str: str):
     dt = datetime(int(date_str[0:4]), int(date_str[5:7]), int(date_str[8:10]))
     iso = dt.isocalendar()
     return int(iso.year), int(iso.week)
-
 
 def resample_weekly(dates, o, h, l, c, v):
     buckets = {}
@@ -172,7 +147,6 @@ def resample_weekly(dates, o, h, l, c, v):
 
     return {"dates": out_dates, "open": out_o, "high": out_h, "low": out_l, "close": out_c, "volume": out_v}
 
-
 def resample_monthly(dates, o, h, l, c, v):
     buckets = {}
     for i, d in enumerate(dates):
@@ -199,9 +173,7 @@ def resample_monthly(dates, o, h, l, c, v):
 
     return {"dates": out_dates, "open": out_o, "high": out_h, "low": out_l, "close": out_c, "volume": out_v}
 
-
 def main():
-    # ✅ 출력 디렉토리 선생성 (Actions에서 경로 문제 방지)
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     os.makedirs(CSV_DIR, exist_ok=True)
 
@@ -209,19 +181,18 @@ def main():
 
     report = {
         "asof_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source": "stooq",
+        "source": "yfinance",  # 소스 이름 업데이트됨
         "params": {"rsi": RSI_PERIOD, "ema": EMA_PERIOD, "sma": SMA_PERIOD},
         "tickers": {},
     }
 
     for sym in tickers:
         try:
-            dates, o, h, l, c, v = fetch_stooq_daily(sym, keep_last=KEEP_LAST)
+            dates, o, h, l, c, v = fetch_yfinance_daily(sym, keep_last=KEEP_LAST)
         except Exception as e:
             report["tickers"][sym] = {"error": str(e)}
             continue
 
-        # ✅ 시계열 CSV 저장
         try:
             csv_path = write_daily_csv(sym, dates, o, h, l, c, v, out_dir=CSV_DIR)
         except Exception as e:
@@ -229,7 +200,6 @@ def main():
             report["tickers"][sym]["csv_error"] = str(e)
             csv_path = None
 
-        # last5 volume
         last5_vol = v[-5:] if len(v) >= 5 else v[:]
         last5_dates = dates[-5:] if len(dates) >= 5 else dates[:]
 
@@ -269,13 +239,11 @@ def main():
                 "last_volume": m["volume"][-1] if m["volume"] else None,
                 **monthly_ind,
             },
-            # 디버그용: CSV가 실제로 생성됐는지 확인 가능
             "csv_path": csv_path,
         }
 
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
-
 
 if __name__ == "__main__":
     main()
