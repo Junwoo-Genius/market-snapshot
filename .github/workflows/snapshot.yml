@@ -32,10 +32,10 @@ jobs:
           git config user.name "snapshot-bot"
           git config user.email "snapshot-bot@users.noreply.github.com"
 
-          # ✅ CSV까지 커밋 대상에 포함 (이게 빠져서 csv가 repo에 안 생긴 것처럼 보였음)
+          # ✅ CSV 강제 커밋 (gitignore 차단 원천 무효화)
           git add public/report.json
-          git add public/csv || true
-          git add public/json || true
+          git add --force public/csv/* || true
+          git add --force public/json/* || true
 
           if git diff --cached --quiet; then
             echo "No changes"
