@@ -1,5 +1,5 @@
 {
-  "asof_utc": "2026-04-03T15:00:26Z",
+  "asof_utc": "2026-04-03T16:08:43Z",
   "source": "stooq",
   "params": {
     "rsi": 14,
@@ -7,254 +7,89 @@
     "sma": 60
   },
   "tickers": {
-    "TSLA": {
-      "error": "TSLA: no data from stooq"
-    },
     "AMD": {
       "error": "AMD: no data from stooq"
-    },
-    "COIN": {
-      "error": "COIN: no data from stooq"
-    },
-    "INTC": {
-      "error": "INTC: no data from stooq"
-    },
-    "BABA": {
-      "error": "BABA: no data from stooq"
-    },
-    "MRVL": {
-      "error": "MRVL: no data from stooq"
-    },
-    "NFLX": {
-      "error": "NFLX: no data from stooq"
-    },
-    "ADBE": {
-      "error": "ADBE: no data from stooq"
-    },
-    "SOFI": {
-      "error": "SOFI: no data from stooq"
-    },
-    "HOOD": {
-      "error": "HOOD: no data from stooq"
-    },
-    "LCID": {
-      "error": "LCID: no data from stooq"
-    },
-    "HIMS": {
-      "error": "HIMS: no data from stooq"
-    },
-    "SNAP": {
-      "error": "SNAP: no data from stooq"
-    },
-    "PATH": {
-      "error": "PATH: no data from stooq"
-    },
-    "RIVN": {
-      "error": "RIVN: no data from stooq"
-    },
-    "SHOP": {
-      "error": "SHOP: no data from stooq"
-    },
-    "PYPL": {
-      "error": "PYPL: no data from stooq"
-    },
-    "SMCI": {
-      "error": "SMCI: no data from stooq"
-    },
-    "CRWD": {
-      "error": "CRWD: no data from stooq"
-    },
-    "LMND": {
-      "error": "LMND: no data from stooq"
-    },
-    "OKLO": {
-      "error": "OKLO: no data from stooq"
-    },
-    "OSCR": {
-      "error": "OSCR: no data from stooq"
-    },
-    "SOUN": {
-      "error": "SOUN: no data from stooq"
-    },
-    "APP": {
-      "error": "APP: no data from stooq"
-    },
-    "ARM": {
-      "error": "ARM: no data from stooq"
-    },
-    "ASML": {
-      "error": "ASML: no data from stooq"
-    },
-    "AVGO": {
-      "error": "AVGO: no data from stooq"
-    },
-    "AVAV": {
-      "error": "AVAV: no data from stooq"
-    },
-    "MSTR": {
-      "error": "MSTR: no data from stooq"
-    },
-    "MU": {
-      "error": "MU: no data from stooq"
-    },
-    "ORCL": {
-      "error": "ORCL: no data from stooq"
-    },
-    "ONDS": {
-      "error": "ONDS: no data from stooq"
-    },
-    "RKLB": {
-      "error": "RKLB: no data from stooq"
-    },
-    "RIOT": {
-      "error": "RIOT: no data from stooq"
-    },
-    "IONQ": {
-      "error": "IONQ: no data from stooq"
-    },
-    "RGTI": {
-      "error": "RGTI: no data from stooq"
-    },
-    "ANET": {
-      "error": "ANET: no data from stooq"
-    },
-    "AMZN": {
-      "error": "AMZN: no data from stooq"
-    },
-    "MSFT": {
-      "error": "MSFT: no data from stooq"
-    },
-    "NVDA": {
-      "error": "NVDA: no data from stooq"
     },
     "TSM": {
       "error": "TSM: no data from stooq"
     },
-    "ORLY": {
-      "error": "ORLY: no data from stooq"
+    "MU": {
+      "error": "MU: no data from stooq"
     },
-    "NIO": {
-      "error": "NIO: no data from stooq"
+    "NVDA": {
+      "error": "NVDA: no data from stooq"
     },
-    "NU": {
-      "error": "NU: no data from stooq"
+    "SNDK": {
+      "error": "SNDK: no data from stooq"
     },
-    "OKTA": {
-      "error": "OKTA: no data from stooq"
+    "INTC": {
+      "error": "INTC: no data from stooq"
     },
-    "OPEN": {
-      "error": "OPEN: no data from stooq"
+    "PLTR": {
+      "error": "PLTR: no data from stooq"
     },
-    "NET": {
-      "error": "NET: no data from stooq"
+    "TSLA": {
+      "error": "TSLA: no data from stooq"
     },
-    "MDB": {
-      "error": "MDB: no data from stooq"
+    "CRCL": {
+      "error": "CRCL: no data from stooq"
     },
-    "LYFT": {
-      "error": "LYFT: no data from stooq"
-    },
-    "JOBY": {
-      "error": "JOBY: no data from stooq"
-    },
-    "QBTS": {
-      "error": "QBTS: no data from stooq"
-    },
-    "QUBT": {
-      "error": "QUBT: no data from stooq"
+    "OKLO": {
+      "error": "OKLO: no data from stooq"
     },
     "SMR": {
       "error": "SMR: no data from stooq"
     },
-    "SNPS": {
-      "error": "SNPS: no data from stooq"
+    "RGTI": {
+      "error": "RGTI: no data from stooq"
     },
-    "LRCX": {
-      "error": "LRCX: no data from stooq"
+    "QBTS": {
+      "error": "QBTS: no data from stooq"
     },
-    "NBIS": {
-      "error": "NBIS: no data from stooq"
-    },
-    "NVTS": {
-      "error": "NVTS: no data from stooq"
+    "IONQ": {
+      "error": "IONQ: no data from stooq"
     },
     "IREN": {
       "error": "IREN: no data from stooq"
     },
-    "DKNG": {
-      "error": "DKNG: no data from stooq"
+    "ASTS": {
+      "error": "ASTS: no data from stooq"
     },
-    "MRNA": {
-      "error": "MRNA: no data from stooq"
+    "RKLB": {
+      "error": "RKLB: no data from stooq"
     },
-    "ZETA": {
-      "error": "ZETA: no data from stooq"
+    "BE": {
+      "error": "BE: no data from stooq"
     },
-    "VST": {
-      "error": "VST: no data from stooq"
+    "NBIS": {
+      "error": "NBIS: no data from stooq"
     },
-    "CVNA": {
-      "error": "CVNA: no data from stooq"
+    "LLY": {
+      "error": "LLY: no data from stooq"
     },
-    "BITF": {
-      "error": "BITF: no data from stooq"
+    "GOOGL": {
+      "error": "GOOGL: no data from stooq"
     },
-    "MP": {
-      "error": "MP: no data from stooq"
+    "META": {
+      "error": "META: no data from stooq"
     },
-    "RKT": {
-      "error": "RKT: no data from stooq"
+    "MSFT": {
+      "error": "MSFT: no data from stooq"
     },
-    "LUNR": {
-      "error": "LUNR: no data from stooq"
-    },
-    "RCAT": {
-      "error": "RCAT: no data from stooq"
-    },
-    "NOK": {
-      "error": "NOK: no data from stooq"
-    },
-    "PL": {
-      "error": "PL: no data from stooq"
-    },
-    "B": {
-      "error": "B: no data from stooq"
-    },
-    "DDOG": {
-      "error": "DDOG: no data from stooq"
-    },
-    "ALAB": {
-      "error": "ALAB: no data from stooq"
+    "HIMS": {
+      "error": "HIMS: no data from stooq"
     },
     "NVO": {
       "error": "NVO: no data from stooq"
     },
-    "TEM": {
-      "error": "TEM: no data from stooq"
+    "SOFI": {
+      "error": "SOFI: no data from stooq"
     },
-    "BULL": {
-      "error": "BULL: no data from stooq"
+    "RIVN": {
+      "error": "RIVN: no data from stooq"
     },
-    "DJT": {
-      "error": "DJT: no data from stooq"
-    },
-    "MARA": {
-      "error": "MARA: no data from stooq"
-    },
-    "GME": {
-      "error": "GME: no data from stooq"
-    },
-    "ETOR": {
-      "error": "ETOR: no data from stooq"
-    },
-    "NOW": {
-      "error": "NOW: no data from stooq"
-    },
-    "RBLX": {
-      "error": "RBLX: no data from stooq"
-    },
-    "SNDK": {
-      "error": "SNDK: no data from stooq"
+    "PL": {
+      "error": "PL: no data from stooq"
     }
   }
 }
