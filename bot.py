@@ -63,20 +63,20 @@ def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
     if df.empty: raise RuntimeError(f"{symbol}: no data from yfinance")
     
     # 🚨 [핵심 해결책: 서머타임 버그 원천 차단]
-    # 1. 타임존(tz) 정보를 완전히 삭제하여 순수 날짜만 남깁니다.
     if df.index.tz is not None:
         df.index = df.index.tz_convert('America/New_York').tz_localize(None)
     
-    # 2. 시간을 무조건 00:00:00 으로 초기화합니다 (새벽 1시 착륙 방지).
     df.index = df.index.normalize()
-    
-    # 3. 과거 주말/휴장일 등의 결측 구간에서 슬라이싱 에러가 나지 않도록 날짜순 정렬을 강제합니다.
     df = df.sort_index()
     
-    # 중복 날짜 제거 및 결측치 방어
     df = df[~df.index.duplicated(keep='last')]
     df = df.ffill().bfill()
     df['Volume'] = df['Volume'].fillna(0)
+
+    # 🚨 [신규 추가] 20일 평균 거래량 및 이격도(%) 연산
+    df['AvgVol20'] = df['Volume'].rolling(window=20).mean()
+    # 분모가 0이 되는 오류(ZeroDivisionError) 방지 처리
+    df['VolDisp20'] = np.where(df['AvgVol20'] > 0, (df['Volume'] - df['AvgVol20']) / df['AvgVol20'] * 100, 0.0)
 
     # 지표 계산
     df['SMA20'] = df['Close'].rolling(window=20).mean()
@@ -95,7 +95,6 @@ def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
     def calc_poc_series(days, target_bins):
         poc_list = []
         for current_date in target_df.index:
-            # 타임존이 사라졌으므로 여기서 며칠을 빼도 무조건 00:00:00으로 정확히 떨어집니다.
             start_date = current_date - pd.Timedelta(days=days)
             window_df = df.loc[start_date:current_date].copy()
             if window_df.empty or len(window_df) < 3:
@@ -126,6 +125,7 @@ def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
     if len(target_df) < 10: raise RuntimeError(f"{symbol}: insufficient rows ({len(target_df)})")
 
     dates, o, h, l, c, v = [], [], [], [], [], []
+    avg_vol20, vol_disp20 = [], []
     sma20, sma60, sma120, sma480, rsi14 = [], [], [], [], []
     poc20, poc90, poc365, poc1095 = [], [], [], []
 
@@ -136,6 +136,11 @@ def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
         l.append(float(row["Low"]) if pd.notna(row["Low"]) else 0.0)
         c.append(float(row["Close"]) if pd.notna(row["Close"]) else 0.0)
         v.append(int(row["Volume"]) if pd.notna(row["Volume"]) else 0)
+        
+        # 🚨 추가된 거래량 지표 데이터 리스트에 삽입
+        avg_vol20.append(int(row["AvgVol20"]) if pd.notna(row["AvgVol20"]) else 0)
+        vol_disp20.append(round(row["VolDisp20"], 2) if pd.notna(row["VolDisp20"]) else 0.0)
+
         sma20.append(round(row["SMA20"], 2) if pd.notna(row["SMA20"]) else "")
         sma60.append(round(row["SMA60"], 2) if pd.notna(row["SMA60"]) else "")
         sma120.append(round(row["SMA120"], 2) if pd.notna(row["SMA120"]) else "")
@@ -145,16 +150,18 @@ def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
         poc90.append(row["POC_90D"])
         poc365.append(row["POC_365D"])
         poc1095.append(row["POC_1095D"])
-    return dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095
+        
+    return dates, o, h, l, c, v, avg_vol20, vol_disp20, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095
 
-def write_daily_csv(sym, dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095, out_dir=CSV_DIR):
+def write_daily_csv(sym, dates, o, h, l, c, v, avg_vol20, vol_disp20, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095, out_dir=CSV_DIR):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{sym.upper()}_daily.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Date", "Open", "High", "Low", "Close", "Volume", "SMA20", "SMA60", "SMA120", "SMA480", "RSI14", "POC_20D_UltraShort", "POC_90D_Short", "POC_365D_Mid", "POC_1095D_Long"])
+        # 🚨 CSV 헤더에 AvgVol20, VolDisp20 순서 맞게 추가
+        w.writerow(["Date", "Open", "High", "Low", "Close", "Volume", "AvgVol20", "VolDisp20", "SMA20", "SMA60", "SMA120", "SMA480", "RSI14", "POC_20D_UltraShort", "POC_90D_Short", "POC_365D_Mid", "POC_1095D_Long"])
         for i in range(len(dates)):
-            w.writerow([dates[i], o[i], h[i], l[i], c[i], v[i], sma20[i], sma60[i], sma120[i], sma480[i], rsi14[i], poc20[i], poc90[i], poc365[i], poc1095[i]])
+            w.writerow([dates[i], o[i], h[i], l[i], c[i], v[i], avg_vol20[i], vol_disp20[i], sma20[i], sma60[i], sma120[i], sma480[i], rsi14[i], poc20[i], poc90[i], poc365[i], poc1095[i]])
     return path
 
 def _iso_week_key(date_str: str):
@@ -220,20 +227,20 @@ def main():
     }
 
     for sym in tickers:
-        print(f"\n▶ [{sym}] 데이터 수집 및 연산 시작...")
+        print(f"\n▶ [{sym}] 데이터 수집 및 연산 시작...", flush=True) # 🚨 진행상황 출력되도록 flush 복구
         try:
-            dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095 = fetch_yfinance_daily(sym, keep_last=KEEP_LAST)
+            dates, o, h, l, c, v, avg_vol20, vol_disp20, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095 = fetch_yfinance_daily(sym, keep_last=KEEP_LAST)
         except Exception as e:
-            print(f"❌ [{sym}] 치명적 에러 발생 (fetch_yfinance_daily):")
+            print(f"❌ [{sym}] 치명적 에러 발생 (fetch_yfinance_daily):", flush=True)
             traceback.print_exc(file=sys.stdout)
             report["tickers"][sym] = {"error": str(e)}
             continue
 
         try:
-            csv_path = write_daily_csv(sym, dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095, out_dir=CSV_DIR)
-            print(f"✅ [{sym}] CSV 생성 완료: {csv_path}")
+            csv_path = write_daily_csv(sym, dates, o, h, l, c, v, avg_vol20, vol_disp20, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095, out_dir=CSV_DIR)
+            print(f"✅ [{sym}] CSV 생성 완료: {csv_path}", flush=True)
         except Exception as e:
-            print(f"❌ [{sym}] CSV 저장 에러 발생:")
+            print(f"❌ [{sym}] CSV 저장 에러 발생:", flush=True)
             traceback.print_exc(file=sys.stdout)
             report["tickers"].setdefault(sym, {})
             report["tickers"][sym]["csv_error"] = str(e)
