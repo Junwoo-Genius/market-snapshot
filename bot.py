@@ -1,16 +1,16 @@
 import os
 import json
 import csv
+import sys
+import traceback
 from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# ===== Parameters (fixed) =====
 RSI_PERIOD = 14
 EMA_PERIOD = 20
 SMA_PERIOD = 60
-
 TICKERS_FILE = os.environ.get("TICKERS_FILE", "tickers.txt")
 OUT_PATH = os.environ.get("OUT_PATH", "public/report.json")
 CSV_DIR = os.environ.get("CSV_DIR", "public/csv")
@@ -26,13 +26,11 @@ def read_tickers(path=TICKERS_FILE):
     return out
 
 def sma(values, period):
-    if len(values) < period:
-        return None
+    if len(values) < period: return None
     return sum(values[-period:]) / period
 
 def ema(values, period):
-    if len(values) < period:
-        return None
+    if len(values) < period: return None
     k = 2 / (period + 1)
     e = values[0]
     for v in values[1:]:
@@ -40,10 +38,8 @@ def ema(values, period):
     return e
 
 def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-    gains = []
-    losses = []
+    if len(values) < period + 1: return None
+    gains, losses = [], []
     for i in range(1, len(values)):
         diff = values[i] - values[i - 1]
         gains.append(max(diff, 0.0))
@@ -53,35 +49,36 @@ def rsi(values, period=14):
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100.0
+    if avg_loss == 0: return 100.0
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
 def compute_indicators(close_series):
-    return {
-        "rsi14": rsi(close_series, RSI_PERIOD),
-        "ema20": ema(close_series, EMA_PERIOD),
-        "sma60": sma(close_series, SMA_PERIOD),
-    }
+    return {"rsi14": rsi(close_series, RSI_PERIOD), "ema20": ema(close_series, EMA_PERIOD), "sma60": sma(close_series, SMA_PERIOD)}
 
 def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
     ticker = yf.Ticker(symbol)
     df = ticker.history(period="max")
     
-    if df.empty:
-        raise RuntimeError(f"{symbol}: no data from yfinance")
-        
-    # 🚨 [방어막 1] 중복 날짜 제거 (yfinance 고질적 오류 방어)
+    if df.empty: raise RuntimeError(f"{symbol}: no data from yfinance")
+    
+    # 🚨 [핵심 해결책: 서머타임 버그 원천 차단]
+    # 1. 타임존(tz) 정보를 완전히 삭제하여 순수 날짜만 남깁니다.
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert('America/New_York').tz_localize(None)
+    
+    # 2. 시간을 무조건 00:00:00 으로 초기화합니다 (새벽 1시 착륙 방지).
+    df.index = df.index.normalize()
+    
+    # 3. 과거 주말/휴장일 등의 결측 구간에서 슬라이싱 에러가 나지 않도록 날짜순 정렬을 강제합니다.
+    df = df.sort_index()
+    
+    # 중복 날짜 제거 및 결측치 방어
     df = df[~df.index.duplicated(keep='last')]
-        
-    if df.index.tz is None:
-        df.index = df.index.tz_localize('UTC')
-
-    # 🚨 [방어막 2] 결측치(NaN) 전처리: 주말/휴장일로 인해 비어있는 데이터를 이전 영업일 기준으로 꽉 채웁니다.
     df = df.ffill().bfill()
     df['Volume'] = df['Volume'].fillna(0)
 
+    # 지표 계산
     df['SMA20'] = df['Close'].rolling(window=20).mean()
     df['SMA60'] = df['Close'].rolling(window=60).mean()
     df['SMA120'] = df['Close'].rolling(window=120).mean()
@@ -98,35 +95,27 @@ def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
     def calc_poc_series(days, target_bins):
         poc_list = []
         for current_date in target_df.index:
+            # 타임존이 사라졌으므로 여기서 며칠을 빼도 무조건 00:00:00으로 정확히 떨어집니다.
             start_date = current_date - pd.Timedelta(days=days)
             window_df = df.loc[start_date:current_date].copy()
-            
             if window_df.empty or len(window_df) < 3:
                 poc_list.append("기간 부족")
                 continue
-                
             window_df = window_df[window_df['Volume'] > 0]
             if window_df.empty:
                 poc_list.append("거래량 0")
                 continue
-
             min_price = window_df['Close'].min()
             max_price = window_df['Close'].max()
             auto_bin = 0.1 if max_price <= min_price else max(0.1, round((max_price - min_price) / target_bins, 1))
-
             window_df['Price_Bin'] = np.floor(window_df['Close'] / auto_bin) * auto_bin
             poc_data = window_df.groupby('Price_Bin')['Volume'].sum()
-
             max_bin = poc_data.idxmax()
             max_vol = poc_data.max()
             total_vol = window_df['Volume'].sum()
             pct = max_vol / total_vol
-
-            if pct >= 0.99:
-                poc_list.append(f"{max_bin:.1f} - {max_bin + auto_bin:.1f} (오류)")
-            else:
-                poc_list.append(f"{max_bin:.1f} - {max_bin + auto_bin:.1f} ({pct:.1%})")
-                
+            if pct >= 0.99: poc_list.append(f"{max_bin:.1f} - {max_bin + auto_bin:.1f} (오류)")
+            else: poc_list.append(f"{max_bin:.1f} - {max_bin + auto_bin:.1f} ({pct:.1%})")
         return poc_list
 
     target_df['POC_20D'] = calc_poc_series(20, 10)
@@ -134,8 +123,7 @@ def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
     target_df['POC_365D'] = calc_poc_series(365, 13)
     target_df['POC_1095D'] = calc_poc_series(1095, 15)
 
-    if len(target_df) < 10:
-        raise RuntimeError(f"{symbol}: insufficient rows ({len(target_df)})")
+    if len(target_df) < 10: raise RuntimeError(f"{symbol}: insufficient rows ({len(target_df)})")
 
     dates, o, h, l, c, v = [], [], [], [], [], []
     sma20, sma60, sma120, sma480, rsi14 = [], [], [], [], []
@@ -143,25 +131,20 @@ def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
 
     for index, row in target_df.iterrows():
         dates.append(index.strftime("%Y-%m-%d"))
-        
-        # 🚨 [방어막 3] 마지막으로 한 번 더 NaN 검증 (절대 에러가 나지 않도록 차단)
         o.append(float(row["Open"]) if pd.notna(row["Open"]) else 0.0)
         h.append(float(row["High"]) if pd.notna(row["High"]) else 0.0)
         l.append(float(row["Low"]) if pd.notna(row["Low"]) else 0.0)
         c.append(float(row["Close"]) if pd.notna(row["Close"]) else 0.0)
         v.append(int(row["Volume"]) if pd.notna(row["Volume"]) else 0)
-        
         sma20.append(round(row["SMA20"], 2) if pd.notna(row["SMA20"]) else "")
         sma60.append(round(row["SMA60"], 2) if pd.notna(row["SMA60"]) else "")
         sma120.append(round(row["SMA120"], 2) if pd.notna(row["SMA120"]) else "")
         sma480.append(round(row["SMA480"], 2) if pd.notna(row["SMA480"]) else "")
         rsi14.append(round(row["RSI14"], 2) if pd.notna(row["RSI14"]) else "")
-        
         poc20.append(row["POC_20D"])
         poc90.append(row["POC_90D"])
         poc365.append(row["POC_365D"])
         poc1095.append(row["POC_1095D"])
-
     return dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095
 
 def write_daily_csv(sym, dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095, out_dir=CSV_DIR):
@@ -169,13 +152,9 @@ def write_daily_csv(sym, dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi
     path = os.path.join(out_dir, f"{sym.upper()}_daily.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Date", "Open", "High", "Low", "Close", "Volume", 
-                    "SMA20", "SMA60", "SMA120", "SMA480", "RSI14", 
-                    "POC_20D_UltraShort", "POC_90D_Short", "POC_365D_Mid", "POC_1095D_Long"])
+        w.writerow(["Date", "Open", "High", "Low", "Close", "Volume", "SMA20", "SMA60", "SMA120", "SMA480", "RSI14", "POC_20D_UltraShort", "POC_90D_Short", "POC_365D_Mid", "POC_1095D_Long"])
         for i in range(len(dates)):
-            w.writerow([dates[i], o[i], h[i], l[i], c[i], v[i], 
-                        sma20[i], sma60[i], sma120[i], sma480[i], rsi14[i], 
-                        poc20[i], poc90[i], poc365[i], poc1095[i]])
+            w.writerow([dates[i], o[i], h[i], l[i], c[i], v[i], sma20[i], sma60[i], sma120[i], sma480[i], rsi14[i], poc20[i], poc90[i], poc365[i], poc1095[i]])
     return path
 
 def _iso_week_key(date_str: str):
@@ -187,8 +166,7 @@ def resample_weekly(dates, o, h, l, c, v):
     buckets = {}
     for i, d in enumerate(dates):
         key = _iso_week_key(d)
-        if key not in buckets:
-            buckets[key] = {"fi": i, "li": i, "high": h[i], "low": l[i], "vol": v[i]}
+        if key not in buckets: buckets[key] = {"fi": i, "li": i, "high": h[i], "low": l[i], "vol": v[i]}
         else:
             b = buckets[key]
             b["li"] = i
@@ -211,8 +189,7 @@ def resample_monthly(dates, o, h, l, c, v):
     buckets = {}
     for i, d in enumerate(dates):
         key = (int(d[0:4]), int(d[5:7]))
-        if key not in buckets:
-            buckets[key] = {"fi": i, "li": i, "high": h[i], "low": l[i], "vol": v[i]}
+        if key not in buckets: buckets[key] = {"fi": i, "li": i, "high": h[i], "low": l[i], "vol": v[i]}
         else:
             b = buckets[key]
             b["li"] = i
@@ -243,15 +220,21 @@ def main():
     }
 
     for sym in tickers:
+        print(f"\n▶ [{sym}] 데이터 수집 및 연산 시작...")
         try:
             dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095 = fetch_yfinance_daily(sym, keep_last=KEEP_LAST)
         except Exception as e:
+            print(f"❌ [{sym}] 치명적 에러 발생 (fetch_yfinance_daily):")
+            traceback.print_exc(file=sys.stdout)
             report["tickers"][sym] = {"error": str(e)}
             continue
 
         try:
             csv_path = write_daily_csv(sym, dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095, out_dir=CSV_DIR)
+            print(f"✅ [{sym}] CSV 생성 완료: {csv_path}")
         except Exception as e:
+            print(f"❌ [{sym}] CSV 저장 에러 발생:")
+            traceback.print_exc(file=sys.stdout)
             report["tickers"].setdefault(sym, {})
             report["tickers"][sym]["csv_error"] = str(e)
             csv_path = None
@@ -260,8 +243,7 @@ def main():
         last5_dates = dates[-5:] if len(dates) >= 5 else dates[:]
         prev_vol = v[-2] if len(v) >= 2 else None
         vol_change_pct = None
-        if prev_vol and prev_vol != 0:
-            vol_change_pct = (v[-1] - prev_vol) / prev_vol * 100.0
+        if prev_vol and prev_vol != 0: vol_change_pct = (v[-1] - prev_vol) / prev_vol * 100.0
 
         daily_ind = compute_indicators(c)
         w = resample_weekly(dates, o, h, l, c, v)
@@ -271,33 +253,15 @@ def main():
         monthly_ind = compute_indicators(m["close"]) if m["close"] else {"rsi14": None, "ema20": None, "sma60": None}
 
         report["tickers"][sym] = {
-            "daily": {
-                "last_date": dates[-1],
-                "last_close": c[-1],
-                "last_volume": v[-1],
-                "volumes_dates_last5": last5_dates,
-                "volumes_last5": last5_vol,
-                "prev_volume": prev_vol,
-                "vol_change_pct": vol_change_pct,
-                **daily_ind,
-            },
-            "weekly": {
-                "last_date": w["dates"][-1] if w["dates"] else None,
-                "last_close": w["close"][-1] if w["close"] else None,
-                "last_volume": w["volume"][-1] if w["volume"] else None,
-                **weekly_ind,
-            },
-            "monthly": {
-                "last_date": m["dates"][-1] if m["dates"] else None,
-                "last_close": m["close"][-1] if m["close"] else None,
-                "last_volume": m["volume"][-1] if m["volume"] else None,
-                **monthly_ind,
-            },
+            "daily": {"last_date": dates[-1], "last_close": c[-1], "last_volume": v[-1], "volumes_dates_last5": last5_dates, "volumes_last5": last5_vol, "prev_volume": prev_vol, "vol_change_pct": vol_change_pct, **daily_ind},
+            "weekly": {"last_date": w["dates"][-1] if w["dates"] else None, "last_close": w["close"][-1] if w["close"] else None, "last_volume": w["volume"][-1] if w["volume"] else None, **weekly_ind},
+            "monthly": {"last_date": m["dates"][-1] if m["dates"] else None, "last_close": m["close"][-1] if m["close"] else None, "last_volume": m["volume"][-1] if m["volume"] else None, **monthly_ind},
             "csv_path": csv_path,
         }
 
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
+    print("\n✅ 모든 프로세스 완료.")
 
 if __name__ == "__main__":
     main()
