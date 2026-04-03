@@ -2,6 +2,8 @@ import os
 import json
 import csv
 from datetime import datetime, timezone
+import numpy as np
+import pandas as pd
 import yfinance as yf
 
 # ===== Parameters (fixed) =====
@@ -42,7 +44,6 @@ def ema(values, period):
     return e
 
 def rsi(values, period=14):
-    # Wilder's RSI (TradingView-style smoothing)
     if len(values) < period + 1:
         return None
 
@@ -74,46 +75,127 @@ def compute_indicators(close_series):
     }
 
 def fetch_yfinance_daily(symbol: str, keep_last: int = KEEP_LAST):
-    """
-    yfinance 라이브러리를 사용하여 야후 파이낸스에서 일봉 OHLCV 데이터를 수집합니다.
-    """
     ticker = yf.Ticker(symbol)
     
-    # max 기간으로 호출하여 분할/배당 보정된 전체 데이터를 가져온 후 필요한 만큼 자릅니다.
+    # max 기간으로 호출하여 분할/배당 보정된 전체 데이터를 가져옵니다.
     df = ticker.history(period="max")
     
     if df.empty:
         raise RuntimeError(f"{symbol}: no data from yfinance")
         
-    df = df.tail(keep_last)
-    
-    if len(df) < 10:
-        raise RuntimeError(f"{symbol}: insufficient rows ({len(df)})")
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC')
 
+    # ==========================================
+    # 1. 이동평균선(SMA) 20, 60, 120, 480일 계산
+    # ==========================================
+    df['SMA20'] = df['Close'].rolling(window=20).mean()
+    df['SMA60'] = df['Close'].rolling(window=60).mean()
+    df['SMA120'] = df['Close'].rolling(window=120).mean()
+    df['SMA480'] = df['Close'].rolling(window=480).mean()
+
+    # ==========================================
+    # 2. RSI(14) 계산 (전체 시계열 기준)
+    # ==========================================
+    delta = df['Close'].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, min_periods=1, adjust=False).mean()
+    loss = (-1 * delta.clip(upper=0)).ewm(alpha=1/14, min_periods=1, adjust=False).mean()
+    rs = gain / loss
+    df['RSI14'] = 100 - (100 / (1 + rs))
+
+    # CSV에 기록할 최근 keep_last 개의 데이터만 자름 (연산 속도 최적화)
+    target_df = df.tail(keep_last).copy()
+
+    # ==========================================
+    # 3. 매물대(POC) 계산 함수 (bot_매물대.py 공식 100% 동일 적용)
+    # ==========================================
+    def calc_poc_series(days, target_bins):
+        poc_list = []
+        # 날짜별로 과거 days 기간만큼 역추적하여 매물대 산출
+        for current_date in target_df.index:
+            start_date = current_date - pd.Timedelta(days=days)
+            window_df = df.loc[start_date:current_date].copy()
+            
+            if window_df.empty or len(window_df) < 3:
+                poc_list.append("기간 부족")
+                continue
+                
+            window_df = window_df[window_df['Volume'] > 0]
+            if window_df.empty:
+                poc_list.append("거래량 0")
+                continue
+
+            min_price = window_df['Close'].min()
+            max_price = window_df['Close'].max()
+            auto_bin = 0.1 if max_price <= min_price else max(0.1, round((max_price - min_price) / target_bins, 1))
+
+            window_df['Price_Bin'] = np.floor(window_df['Close'] / auto_bin) * auto_bin
+            poc_data = window_df.groupby('Price_Bin')['Volume'].sum()
+
+            max_bin = poc_data.idxmax()
+            max_vol = poc_data.max()
+            total_vol = window_df['Volume'].sum()
+            pct = max_vol / total_vol
+
+            if pct >= 0.99:
+                poc_list.append(f"{max_bin:.1f} - {max_bin + auto_bin:.1f} (오류)")
+            else:
+                poc_list.append(f"{max_bin:.1f} - {max_bin + auto_bin:.1f} ({pct:.1%})")
+                
+        return poc_list
+
+    # 다중 시간축 매물대 스캔 (20일, 90일, 365일, 1095일)
+    target_df['POC_20D'] = calc_poc_series(20, 10)
+    target_df['POC_90D'] = calc_poc_series(90, 12)
+    target_df['POC_365D'] = calc_poc_series(365, 13)
+    target_df['POC_1095D'] = calc_poc_series(1095, 15)
+
+    if len(target_df) < 10:
+        raise RuntimeError(f"{symbol}: insufficient rows ({len(target_df)})")
+
+    # 기존 포맷에 맞추어 리스트로 반환 데이터 준비
     dates, o, h, l, c, v = [], [], [], [], [], []
-    for index, row in df.iterrows():
-        # yfinance index는 Datetime이므로 문자열로 변환 (stooq과 동일한 포맷)
+    sma20, sma60, sma120, sma480, rsi14 = [], [], [], [], []
+    poc20, poc90, poc365, poc1095 = [], [], [], []
+
+    for index, row in target_df.iterrows():
         dates.append(index.strftime("%Y-%m-%d"))
         o.append(float(row["Open"]))
         h.append(float(row["High"]))
         l.append(float(row["Low"]))
         c.append(float(row["Close"]))
         v.append(int(row["Volume"]))
+        
+        # 지표 데이터 추가 (NaN 처리)
+        sma20.append(round(row["SMA20"], 2) if pd.notna(row["SMA20"]) else "")
+        sma60.append(round(row["SMA60"], 2) if pd.notna(row["SMA60"]) else "")
+        sma120.append(round(row["SMA120"], 2) if pd.notna(row["SMA120"]) else "")
+        sma480.append(round(row["SMA480"], 2) if pd.notna(row["SMA480"]) else "")
+        rsi14.append(round(row["RSI14"], 2) if pd.notna(row["RSI14"]) else "")
+        
+        poc20.append(row["POC_20D"])
+        poc90.append(row["POC_90D"])
+        poc365.append(row["POC_365D"])
+        poc1095.append(row["POC_1095D"])
 
-    return dates, o, h, l, c, v
+    return dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095
 
-def write_daily_csv(sym, dates, o, h, l, c, v, out_dir=CSV_DIR):
+def write_daily_csv(sym, dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095, out_dir=CSV_DIR):
     """
-    종목별 시계열(일봉 OHLCV)을 CSV로 저장
-    저장 경로: public/csv/{TICKER}_daily.csv
+    종목별 시계열(일봉 OHLCV + 이평선 + 매물대 + RSI)을 CSV로 확장 저장
     """
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{sym.upper()}_daily.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Date", "Open", "High", "Low", "Close", "Volume"])
+        # CSV 헤더 확장 적용
+        w.writerow(["Date", "Open", "High", "Low", "Close", "Volume", 
+                    "SMA20", "SMA60", "SMA120", "SMA480", "RSI14", 
+                    "POC_20D_UltraShort", "POC_90D_Short", "POC_365D_Mid", "POC_1095D_Long"])
         for i in range(len(dates)):
-            w.writerow([dates[i], o[i], h[i], l[i], c[i], v[i]])
+            w.writerow([dates[i], o[i], h[i], l[i], c[i], v[i], 
+                        sma20[i], sma60[i], sma120[i], sma480[i], rsi14[i], 
+                        poc20[i], poc90[i], poc365[i], poc1095[i]])
     return path
 
 def _iso_week_key(date_str: str):
@@ -138,7 +220,7 @@ def resample_weekly(dates, o, h, l, c, v):
     for key in sorted(buckets.keys()):
         b = buckets[key]
         fi, li = b["fi"], b["li"]
-        out_dates.append(dates[li])  # last trading day of the week
+        out_dates.append(dates[li])
         out_o.append(o[fi])
         out_h.append(b["high"])
         out_l.append(b["low"])
@@ -164,7 +246,7 @@ def resample_monthly(dates, o, h, l, c, v):
     for key in sorted(buckets.keys()):
         b = buckets[key]
         fi, li = b["fi"], b["li"]
-        out_dates.append(dates[li])  # last trading day of the month
+        out_dates.append(dates[li])
         out_o.append(o[fi])
         out_h.append(b["high"])
         out_l.append(b["low"])
@@ -181,20 +263,22 @@ def main():
 
     report = {
         "asof_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source": "yfinance",  # 소스 이름 업데이트됨
+        "source": "yfinance",
         "params": {"rsi": RSI_PERIOD, "ema": EMA_PERIOD, "sma": SMA_PERIOD},
         "tickers": {},
     }
 
     for sym in tickers:
         try:
-            dates, o, h, l, c, v = fetch_yfinance_daily(sym, keep_last=KEEP_LAST)
+            # 반환 데이터 구조 확장에 맞춘 언패킹
+            dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095 = fetch_yfinance_daily(sym, keep_last=KEEP_LAST)
         except Exception as e:
             report["tickers"][sym] = {"error": str(e)}
             continue
 
         try:
-            csv_path = write_daily_csv(sym, dates, o, h, l, c, v, out_dir=CSV_DIR)
+            # 확장된 데이터들을 CSV 저장 함수로 전달
+            csv_path = write_daily_csv(sym, dates, o, h, l, c, v, sma20, sma60, sma120, sma480, rsi14, poc20, poc90, poc365, poc1095, out_dir=CSV_DIR)
         except Exception as e:
             report["tickers"].setdefault(sym, {})
             report["tickers"][sym]["csv_error"] = str(e)
